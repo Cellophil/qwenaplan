@@ -1,0 +1,966 @@
+from abc import ABC, abstractmethod
+from .base import Component, PowerElement, BranchElement
+import polars as pl
+import pyoframe as pf
+from .physics import DCPhysics  # Import the logic
+
+
+class Bus(Component):
+    """Bus (node) in the power grid.
+    
+    Parameters
+    ----------
+    name : str
+        Unique identifier for the bus
+    network : Network
+        Reference to the parent network
+    v_nom : float, default 1.0
+        Nominal voltage in kV (used for impedance base conversion)
+    carrier : str, default "AC"
+        Energy carrier / bus type (organizational only)
+    x : float, default 0.0
+        X coordinate for geographic visualization
+    y : float, default 0.0
+        Y coordinate for geographic visualization
+    """
+    
+    def __init__(self, name: str, network: "Network", v_nom: float = 1.0,
+                 carrier: str = "AC", x: float = 0.0, y: float = 0.0):
+        super().__init__(name, network)
+        self.v_nom = v_nom
+        self.carrier = carrier
+        self.x = x
+        self.y = y
+
+    def setup_variables(self):
+        # Nodal injection (MW) and Phase Angle (rad) - indexed by snapshots
+        df = self.network.snapshots.to_frame()
+        self.p_net = pf.Variable(df)
+        self.theta = pf.Variable(df)
+
+    def setup_variables_for_model(self, model):
+        # Add variables to the model so they can be used in expressions
+        setattr(model, f"p_net_{self.name}", self.p_net)
+        setattr(model, f"theta_{self.name}", self.theta)
+
+    def setup_constraints(self, model):
+        # Trigger the physics engine to build KCL for this bus
+        DCPhysics.apply_kirchhoff_current_law(self, model)
+
+    def setup_objective(self, model):
+        # Bus has no direct contribution to the objective function
+        pass
+
+    def __repr__(self) -> str:
+        return f"<Bus(name={self.name}, v_nom={self.v_nom})>"
+
+
+class ACLine(BranchElement):
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        from_bus: "Bus",
+        to_bus: "Bus",
+        x_pu: float = 0.1,
+        s_nom: float = 0.0,
+    ):
+        super().__init__(name, network, from_bus, to_bus)
+        self.x_pu = x_pu
+        self.s_nom = s_nom
+
+    def setup_variables(self):
+        # Explicit flow variable for numerical stability (as discussed) - indexed by snapshots
+        df = self.network.snapshots.to_frame()
+        self.p = pf.Variable(df)
+
+    def setup_variables_for_model(self, model):
+        # Add variables to the model so they can be used in expressions
+        setattr(model, f"p_{self.name}", self.p)
+
+    def setup_constraints(self, model):
+        # 1. Apply KVL to link this line's flow to bus angles
+        DCPhysics.apply_kirchhoff_voltage_law(self, model)
+
+        # 2. Add thermal limits (if defined)
+        if self.s_nom > 0:
+            setattr(model, f"line_limit_{self.name}", -self.s_nom <= self.p <= self.s_nom)
+
+    def setup_objective(self, model):
+        # ACLine has no direct contribution to the objective function
+        pass
+
+    def __repr__(self) -> str:
+        return f"<ACLine(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, x_pu={self.x_pu}, s_nom={self.s_nom})>"
+
+
+class Generator(PowerElement):
+    """Power generator component.
+    
+    Parameters
+    ----------
+    name : str
+        Unique identifier for the generator
+    network : Network
+        Reference to the parent network
+    bus : Bus
+        Bus where the generator is connected
+    p_nom : float, default 0.0
+        Nominal power limit (MW)
+    marginal_cost : float, default 0.0
+        Marginal cost per MWh
+    carrier : str, default ""
+        Energy carrier (e.g., "AC", "solar", "wind") - organizational metadata
+    p_max_pu : float | pl.Series | None, default None
+        Maximum power as per-unit of p_nom (None = use p_nom directly).
+        Can be a static value (0-1) or a time-series profile.
+    p_min_pu : float | pl.Series | None, default None
+        Minimum power as per-unit of p_nom (None = use 0).
+        Can be a static value (0-1) or a time-series profile.
+        Must be <= p_max_pu wherever both are defined.
+    ramp_limit_up : float, default None
+        Maximum ramp-up rate as per-unit of p_nom per snapshot (None = no limit).
+        0.2 means the generator can increase by at most 20% of p_nom between snapshots.
+    ramp_limit_down : float, default None
+        Maximum ramp-down rate as per-unit of p_nom per snapshot (None = no limit).
+        0.2 means the generator can decrease by at most 20% of p_nom between snapshots.
+    """
+    
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        bus: "Bus",
+        p_nom: float = 0.0,
+        marginal_cost: float = 0.0,
+        carrier: str = "",
+        p_max_pu: float | pl.Series = None,
+        p_min_pu: float | pl.Series = None,
+        ramp_limit_up: float = None,
+        ramp_limit_down: float = None,
+    ):
+        super().__init__(name, network, bus)
+        self.p_nom = p_nom
+        self.marginal_cost = marginal_cost
+        self.carrier = carrier
+        
+        # Validate p_min_pu <= p_max_pu for static values
+        if (isinstance(p_max_pu, (int, float)) and isinstance(p_min_pu, (int, float)) and
+            p_max_pu is not None and p_min_pu is not None):
+            if p_min_pu > p_max_pu:
+                raise ValueError(
+                    f"Generator '{self.name}': p_min_pu ({p_min_pu}) must be <= p_max_pu ({p_max_pu})"
+                )
+        
+        self._p_max_pu_profile = p_max_pu if isinstance(p_max_pu, pl.Series) else None
+        self._p_max_pu = p_max_pu if not isinstance(p_max_pu, pl.Series) else None
+        self._p_min_pu_profile = p_min_pu if isinstance(p_min_pu, pl.Series) else None
+        self._p_min_pu = p_min_pu if not isinstance(p_min_pu, pl.Series) else None
+        
+        self.ramp_limit_up = ramp_limit_up
+        self.ramp_limit_down = ramp_limit_down
+
+    def setup_variables(self):
+        # Create P_t variable - indexed by snapshots
+        df = self.network.snapshots.to_frame()
+        self.p = pf.Variable(df)
+
+    def setup_variables_for_model(self, model):
+        # Add variables to the model so they can be used in expressions
+        setattr(model, f"p_{self.name}", self.p)
+
+    def setup_constraints(self, model):
+        snapshots = self.network.snapshots
+        dim_name = snapshots.name
+        
+        # 1. Build max limit (as Param for pyoframe compatibility)
+        if self._p_max_pu_profile is not None:
+            # Profile-based max: validate against profile min
+            profile_min = self._p_max_pu_profile.min()
+            if self._p_min_pu is not None and not isinstance(self._p_min_pu, pl.Series):
+                if self._p_min_pu > profile_min:
+                    raise ValueError(
+                        f"Generator '{self.name}': p_min_pu ({self._p_min_pu}) exceeds "
+                        f"minimum p_max_pu profile value ({profile_min})"
+                    )
+            # Create DataFrame with snapshots index and scaled profile values
+            max_df = snapshots.to_frame().with_columns(
+                (self._p_max_pu_profile * self.p_nom).alias("max")
+            )
+            max_param = pf.Param(max_df)
+        elif self._p_max_pu is not None:
+            max_param = pf.Param(snapshots.to_frame().with_columns(
+                pl.lit(self.p_nom * self._p_max_pu).alias("max")
+            ))
+        else:
+            max_param = pf.Param(snapshots.to_frame().with_columns(
+                pl.lit(self.p_nom).alias("max")
+            ))
+        
+        # 2. Build min limit (as Param for pyoframe compatibility)
+        if self._p_min_pu_profile is not None:
+            # Profile-based min: validate against static max
+            profile_max = self._p_min_pu_profile.max()
+            if self._p_max_pu is not None and not isinstance(self._p_max_pu, pl.Series):
+                if self._p_max_pu < profile_max:
+                    raise ValueError(
+                        f"Generator '{self.name}': p_max_pu ({self._p_max_pu}) is below "
+                        f"maximum p_min_pu profile value ({profile_max})"
+                    )
+            min_df = snapshots.to_frame().with_columns(
+                (self._p_min_pu_profile * self.p_nom).alias("min")
+            )
+            min_param = pf.Param(min_df)
+        elif self._p_min_pu is not None:
+            min_param = pf.Param(snapshots.to_frame().with_columns(
+                pl.lit(self.p_nom * self._p_min_pu).alias("min")
+            ))
+        else:
+            min_param = pf.Param(snapshots.to_frame().with_columns(
+                pl.lit(0.0).alias("min")
+            ))
+        
+        # Apply min/max bounds: min_param <= p <= max_param
+        setattr(model, f"gen_limit_{self.name}", self.p <= max_param)
+        setattr(model, f"gen_lower_{self.name}", self.p >= min_param)
+        
+        # 3. Ramping constraints (if defined)
+        if self.ramp_limit_up is not None or self.ramp_limit_down is not None:
+            if self.ramp_limit_up is not None:
+                ramp_up_limit = self.p_nom * self.ramp_limit_up
+                # p(t) - p(t-1) <= ramp_up_limit
+                # Use .next() to shift: p.next() is p(t), p is p(t-1) (with first element dropped)
+                p_current = self.p.next(dim_name)
+                p_previous = self.p.drop_extras()
+                setattr(
+                    model,
+                    f"gen_ramp_up_{self.name}",
+                    p_current - p_previous <= ramp_up_limit,
+                )
+            
+            if self.ramp_limit_down is not None:
+                ramp_down_limit = self.p_nom * self.ramp_limit_down
+                # p(t-1) - p(t) <= ramp_down_limit
+                p_current = self.p.next(dim_name)
+                p_previous = self.p.drop_extras()
+                setattr(
+                    model,
+                    f"gen_ramp_down_{self.name}",
+                    p_previous - p_current <= ramp_down_limit,
+                )
+
+    def setup_objective(self, model):
+        # Add marginal cost contribution to objective: sum(p(t) * marginal_cost)
+        if self.marginal_cost != 0:
+            objective_expr = self.p * self.marginal_cost
+            setattr(model, f"objective_{self.name}", objective_expr)
+
+    def __repr__(self) -> str:
+        return f"<Generator(name={self.name}, bus={self.bus.name}, p_nom={self.p_nom}, marginal_cost={self.marginal_cost})>"
+
+
+class Link(BranchElement):
+    """Controllable flow between two buses.
+    
+    Parameters
+    ----------
+    name : str
+        Unique identifier for the link
+    network : Network
+        Reference to the parent network
+    from_bus : Bus
+        From bus (source)
+    to_bus : Bus
+        To bus (destination)
+    p_nom : float, default 0.0
+        Nominal power limit (MW)
+    carrier : str, default ""
+        Energy carrier (organizational metadata)
+    efficiency : float, default 1.0
+        Efficiency factor (power loss as fraction, 1.0 = no loss)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        from_bus: "Bus",
+        to_bus: "Bus",
+        p_nom: float = 0.0,
+        carrier: str = "",
+        efficiency: float = 1.0,
+    ):
+        super().__init__(name, network, from_bus, to_bus)
+        self.p_nom = p_nom
+        self.carrier = carrier
+        self.efficiency = efficiency
+
+    def setup_variables(self):
+        df = self.network.snapshots.to_frame()
+        self.p = pf.Variable(df)
+
+    def setup_variables_for_model(self, model):
+        # Add variables to the model so they can be used in expressions
+        setattr(model, f"p_{self.name}", self.p)
+
+    def setup_constraints(self, model):
+        setattr(model, f"link_limit_{self.name}", -self.p_nom <= self.p <= self.p_nom)
+
+    def setup_objective(self, model):
+        # Link has no direct contribution to the objective function
+        pass
+
+    def __repr__(self) -> str:
+        return f"<Link(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, p_nom={self.p_nom})>"
+
+
+class _StorageBase(PowerElement):
+    """
+    Generic base class for storage components.
+    
+    This class defines the generic storage interface with p_in (inflow) and p_out (outflow)
+    variables. It can be used directly or as a base for composite storage types.
+    
+    The SOC dynamics are defined here and reused by all storage types.
+    
+    Follows PyPSA convention:
+    soc(t) = soc(t-1) + p_in(t) * eff_in - p_out(t) / eff_out + influx(t)
+    
+    Parameters
+    ----------
+    name : str
+        Unique identifier for the storage unit
+    network : Network
+        Reference to the parent network
+    bus : Bus
+        Bus where the storage is connected
+    e_nom : float
+        Nominal energy capacity (MWh)
+    p_nom_in : float, default 0
+        Maximum inflow power (MW), 0 = unlimited
+    p_nom_out : float, default 0
+        Maximum outflow power (MW), 0 = unlimited
+    eff_in : float, default 1.0
+        Inflow efficiency (0 < eff, can be >1 for abstract cases)
+    eff_out : float, default 1.0
+        Outflow efficiency (0 < eff)
+    initial_soc : float, default 0.0
+        Initial state of charge (MWh)
+    soc_min : float, optional
+        Minimum SOC limit (None = no limit)
+    soc_max : float, optional
+        Maximum SOC limit (None = e_nom)
+    influx : float, default 0.0
+        Constant static influx (MW equivalent, e.g., water inflow)
+    
+    Backward compatibility:
+    - p_nom_store -> p_nom_in
+    - p_nom_dispatch -> p_nom_out
+    - eff_store -> eff_in
+    - eff_dispatch -> eff_out
+    """
+
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        bus: "Bus",
+        e_nom: float,
+        p_nom_in: float = 0.0,
+        p_nom_out: float = 0.0,
+        eff_in: float = 1.0,
+        eff_out: float = 1.0,
+        initial_soc: float = 0.0,
+        soc_min: float = None,
+        soc_max: float = None,
+        influx: float = 0.0,
+        carrier: str = "",
+        # Backward compatibility parameters
+        p_nom_store: float = None,
+        p_nom_dispatch: float = None,
+        eff_store: float = None,
+        eff_dispatch: float = None,
+    ):
+        super().__init__(name, network, bus)
+        self.e_nom = e_nom
+        self.carrier = carrier
+        
+        # Handle backward compatibility for parameter names
+        if p_nom_store is not None:
+            self.p_nom_in = p_nom_store
+        else:
+            self.p_nom_in = p_nom_in
+            
+        if p_nom_dispatch is not None:
+            self.p_nom_out = p_nom_dispatch
+        else:
+            self.p_nom_out = p_nom_out
+            
+        if eff_store is not None:
+            self.eff_in = eff_store
+        else:
+            self.eff_in = eff_in
+            
+        if eff_dispatch is not None:
+            self.eff_out = eff_dispatch
+        else:
+            self.eff_out = eff_out
+            
+        self.initial_soc = initial_soc
+        self.soc_min = soc_min if soc_min is not None else 0.0
+        self.soc_max = soc_max if soc_max is not None else e_nom
+        self._influx = influx
+        self._influx_profile = None
+
+    def set_influx_profile(self, profile: pl.Series):
+        """Set a time-series profile for the static influx."""
+        self._influx_profile = profile
+        self._influx = None
+
+    def setup_variables(self):
+        """Create pyoframe variables indexed by snapshots."""
+        df = self.network.snapshots.to_frame()
+        self.soc = pf.Variable(df)
+        self.p_in = pf.Variable(df)
+        self.p_out = pf.Variable(df)
+
+        # Prepare influx as time-series aligned with snapshots
+        if self._influx_profile is not None:
+            self._influx_series = self._influx_profile
+        else:
+            self._influx_series = pl.Series([self._influx] * len(df))
+
+    def setup_variables_for_model(self, model):
+        """Add variables to the model."""
+        setattr(model, f"soc_{self.name}", self.soc)
+        setattr(model, f"p_in_{self.name}", self.p_in)
+        setattr(model, f"p_out_{self.name}", self.p_out)
+
+    def setup_objective(self, model):
+        """Storage base has no direct contribution to the objective function."""
+        pass
+
+    def _setup_soc_constraints(self, model, influx_param: pf.Param):
+        """
+        Setup SOC balance and bounds constraints.
+        
+        This is the core storage logic that all storage types share.
+        
+        Parameters
+        ----------
+        model : pf.Model
+            The optimization model
+        influx_param : pf.Param
+            Time-series influx parameter
+        """
+        snapshots = self.network.snapshots
+        dim_name = snapshots.name
+
+        # 1. SOC Balance Equation (PyPSA convention)
+        # Note: .next() shifts values forward, so soc.next() has one fewer element than soc.
+        # We apply .drop_extras() to the soc term on the right side to align dimensions.
+        # influx_param is a Param (not a Variable), so we use .drop_extras() instead of .next()
+        soc_balance = (
+            self.soc.next(dim_name)
+            == (
+                self.soc.drop_extras()
+                + self.p_in.next(dim_name) * self.eff_in
+                - self.p_out.next(dim_name) / self.eff_out
+                + influx_param.drop_extras()
+            )
+        )
+        setattr(model, f"soc_balance_{self.name}", soc_balance)
+
+        # 2. Initial SOC constraint
+        first_snapshot = snapshots[0]
+        initial_soc_constraint = (
+            self.soc.filter(pl.col(snapshots.name) == first_snapshot)
+            == self.initial_soc
+            + self.p_in.filter(pl.col(snapshots.name) == first_snapshot) * self.eff_in
+            - self.p_out.filter(pl.col(snapshots.name) == first_snapshot) / self.eff_out
+            + influx_param.filter(pl.col(snapshots.name) == first_snapshot)
+        )
+        setattr(model, f"initial_soc_{self.name}", initial_soc_constraint)
+
+        # 3. Inflow power limits
+        if self.p_nom_in > 0:
+            setattr(model, f"p_in_limit_{self.name}", 0 <= self.p_in <= self.p_nom_in)
+        else:
+            setattr(model, f"p_in_limit_{self.name}", self.p_in >= 0)
+
+        # 4. Outflow power limits
+        if self.p_nom_out > 0:
+            setattr(model, f"p_out_limit_{self.name}", 0 <= self.p_out <= self.p_nom_out)
+        else:
+            setattr(model, f"p_out_limit_{self.name}", self.p_out >= 0)
+
+        # 5. SOC bounds
+        setattr(model, f"soc_min_{self.name}", self.soc >= self.soc_min)
+        setattr(model, f"soc_max_{self.name}", self.soc <= self.soc_max)
+
+    def setup_constraints(self, model):
+        """
+        Setup constraints for storage.
+        
+        Default implementation that can be used directly or overridden by subclasses.
+        """
+        snapshots = self.network.snapshots
+        dim_name = snapshots.name
+
+        # Convert influx to pyoframe Param
+        if dim_name in self._influx_series.name:
+            influx_df = self._influx_series.to_frame()
+        else:
+            influx_df = self.network.snapshots.to_frame().with_columns(
+                pl.lit(self._influx).alias("influx")
+            )
+        influx_param = pf.Param(influx_df)
+
+        # Setup core SOC constraints
+        self._setup_soc_constraints(model, influx_param)
+
+    def get_p_net(self):
+        """
+        Return net power injection for KCL.
+
+        Net power = p_out - p_in
+        Positive = power injected into bus
+        Negative = power withdrawn from bus
+        """
+        return self.p_out - self.p_in
+
+
+class StorageUnit(_StorageBase):
+    """
+    Concrete storage unit with charge/discharge semantics.
+    
+    This is the standard storage unit where:
+    - p_in maps to p_store (charging)
+    - p_out maps to p_dispatch (discharging)
+    
+    For backward compatibility and direct use cases.
+    """
+
+    def setup_constraints(self, model):
+        """Add constraints to the optimization model."""
+        snapshots = self.network.snapshots
+        dim_name = snapshots.name
+
+        # Convert influx to pyoframe Param
+        if dim_name in self._influx_series.name:
+            influx_df = self._influx_series.to_frame()
+        else:
+            influx_df = self.network.snapshots.to_frame().with_columns(
+                pl.lit(self._influx).alias("influx")
+            )
+        influx_param = pf.Param(influx_df)
+
+        # Setup core SOC constraints
+        self._setup_soc_constraints(model, influx_param)
+
+    def get_p_net(self):
+        """
+        Return net power injection for KCL.
+
+        Net power = dispatch (out) - store (in)
+        Positive = power injected into bus
+        Negative = power withdrawn from bus
+        """
+        return self.p_out - self.p_in
+
+    # Backward compatibility properties
+    @property
+    def p_store(self):
+        """Alias for p_in (charging)."""
+        return self.p_in
+
+    @property
+    def p_dispatch(self):
+        """Alias for p_out (discharging)."""
+        return self.p_out
+
+    @property
+    def p_nom_store(self):
+        """Alias for p_nom_in."""
+        return self.p_nom_in
+
+    @property
+    def p_nom_dispatch(self):
+        """Alias for p_nom_out."""
+        return self.p_nom_out
+
+    @property
+    def eff_store(self):
+        """Alias for eff_in."""
+        return self.eff_in
+
+    @property
+    def eff_dispatch(self):
+        """Alias for eff_out."""
+        return self.eff_out
+
+    def __repr__(self) -> str:
+        return f"<StorageUnit(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom})>"
+
+
+class StorageComposite(ABC):
+    """
+    Abstract base class for composite storage components.
+    
+    A composite storage holds a _StorageBase instance and optionally a Generator,
+    and maps the storage's p_in/p_out to domain-specific variables.
+    
+    Subclasses define:
+    - How p_in/p_out map to their specific variables (e.g., charge/discharge, pump/turbine)
+    - Whether a generator is needed (e.g., pumped hydro has a generator, battery doesn't)
+    - Any coupling constraints between storage and generator
+    """
+
+    def __init__(self, name: str, network: "Network", bus: "Bus"):
+        self.name = name
+        self.network = network
+        self.bus = bus
+        self._storage: _StorageBase = None
+        self._generator: Generator = None
+
+    @property
+    def storage(self) -> _StorageBase:
+        """Access the internal storage component."""
+        return self._storage
+
+    @property
+    def generator(self) -> Generator:
+        """Access the internal generator component (if any)."""
+        return self._generator
+
+    @abstractmethod
+    def _create_storage(self) -> _StorageBase:
+        """Create and configure the internal storage component."""
+        pass
+
+    def _create_generator(self) -> Generator | None:
+        """Create generator if needed. Override in subclasses."""
+        return None
+
+    def setup_variables(self):
+        """Setup variables for all internal components."""
+        self._storage.setup_variables()
+        if self._generator:
+            self._generator.setup_variables()
+
+    def setup_variables_for_model(self, model):
+        """Add variables to the model."""
+        self._storage.setup_variables_for_model(model)
+        if self._generator:
+            self._generator.setup_variables_for_model(model)
+
+    @abstractmethod
+    def setup_constraints(self, model):
+        """Setup constraints - must be implemented by subclasses."""
+        pass
+
+    @abstractmethod
+    def get_p_net(self):
+        """Return net power injection for KCL."""
+        pass
+
+    def setup_objective(self, model):
+        """Delegate objective contribution to internal components."""
+        self._storage.setup_objective(model)
+        if self._generator:
+            self._generator.setup_objective(model)
+
+    # Common property delegates
+    @property
+    def soc(self):
+        """State of charge (from storage)."""
+        return self._storage.soc
+
+
+class PumpedHydroStorage(StorageComposite):
+    """
+    Composite class for pumped hydro storage.
+
+    Combines a _StorageBase (reservoir/SOC) with a Generator (turbine output).
+    The storage p_out represents water flow through the turbine,
+    and the generator output is the electrical power produced.
+
+    Variable mapping:
+    - storage.p_in -> pump (pumping water back to reservoir)
+    - storage.p_out -> dispatch (water flowing through turbine)
+    - generator.p -> electrical output (dispatch * gen_efficiency)
+
+    Parameters
+    ----------
+    name : str
+        Unique identifier for the pumped hydro storage
+    network : Network
+        Reference to the parent network
+    bus : Bus
+        Bus where the storage is connected
+    e_nom : float
+        Nominal energy capacity of reservoir (MWh equivalent)
+    p_nom_turbine : float
+        Maximum turbine power (MW) - limits both dispatch and generator
+    p_nom_pump : float, default 0
+        Maximum pumping power (MW), 0 = unlimited
+    eff_store : float, default 1.0
+        Pumping efficiency
+    eff_dispatch : float, default 1.0
+        Hydraulic efficiency (water to mechanical)
+    gen_efficiency : float, default 0.9
+        Generator efficiency (mechanical to electrical)
+    initial_soc : float, default 0.0
+        Initial state of charge
+    soc_min : float, optional
+        Minimum SOC limit
+    soc_max : float, optional
+        Maximum SOC limit (defaults to e_nom)
+    influx : float, default 0.0
+        Constant static influx (water inflow)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        bus: "Bus",
+        e_nom: float,
+        p_nom_turbine: float,
+        p_nom_pump: float = 0.0,
+        eff_store: float = 1.0,
+        eff_dispatch: float = 1.0,
+        gen_efficiency: float = 0.9,
+        initial_soc: float = 0.0,
+        soc_min: float = None,
+        soc_max: float = None,
+        influx: float = 0.0,
+    ):
+        super().__init__(name, network, bus)
+
+        # Store parameters for reference
+        self.e_nom = e_nom
+        self.p_nom_turbine = p_nom_turbine
+        self.p_nom_pump = p_nom_pump
+        self.eff_store = eff_store
+        self.eff_dispatch = eff_dispatch
+        self.gen_efficiency = gen_efficiency
+        self.initial_soc = initial_soc
+        self.soc_min = soc_min if soc_min is not None else 0.0
+        self.soc_max = soc_max if soc_max is not None else e_nom
+        self.influx = influx
+
+        # Create internal components
+        self._storage = self._create_storage()
+        self._generator = self._create_generator()
+
+    def _create_storage(self) -> _StorageBase:
+        """Create the internal storage component (reservoir)."""
+        return _StorageBase(
+            name=f"{self.name}_storage",
+            network=self.network,
+            bus=self.bus,
+            e_nom=self.e_nom,
+            p_nom_in=self.p_nom_pump,  # p_in = pump
+            p_nom_out=self.p_nom_turbine,  # p_out = water dispatch
+            eff_in=self.eff_store,
+            eff_out=self.eff_dispatch,
+            initial_soc=self.initial_soc,
+            soc_min=self.soc_min,
+            soc_max=self.soc_max,
+            influx=self.influx,
+        )
+
+    def _create_generator(self) -> Generator:
+        """Create the internal generator component (turbine + generator)."""
+        return Generator(
+            name=f"{self.name}_generator",
+            network=self.network,
+            bus=self.bus,
+            p_nom=self.p_nom_turbine,
+        )
+
+    def setup_constraints(self, model):
+        """Setup constraints for storage and generator coupling."""
+        # Setup storage SOC constraints (reuses base class logic)
+        snapshots = self.network.snapshots
+        dim_name = snapshots.name
+
+        # Convert influx to pyoframe Param
+        influx_df = snapshots.to_frame().with_columns(
+            pl.lit(self.influx).alias("influx")
+        )
+        influx_param = pf.Param(influx_df)
+
+        # Setup core SOC constraints from base class
+        self._storage._setup_soc_constraints(model, influx_param)
+
+        # Setup generator constraints
+        self._generator.setup_constraints(model)
+
+        # Coupling constraint: electrical output = water dispatch * gen_efficiency
+        setattr(
+            model,
+            f"{self.name}_coupling",
+            self._generator.p == self._storage.p_out * self.gen_efficiency,
+        )
+
+    def get_p_net(self):
+        """
+        Return net power injection for KCL.
+
+        For PHS, this is the generator output (electrical power to bus).
+        """
+        return self._generator.p
+
+    # Property delegates for transparent access
+    @property
+    def p(self):
+        """Electrical power output (from generator)."""
+        return self._generator.p
+
+    @property
+    def p_store(self):
+        """Pumping power (from storage.p_in)."""
+        return self._storage.p_in
+
+    @property
+    def p_dispatch(self):
+        """Water discharge rate (from storage.p_out)."""
+        return self._storage.p_out
+
+    def setup_objective(self, model):
+        """Delegate objective to internal generator (which may have marginal costs)."""
+        if self._generator:
+            self._generator.setup_objective(model)
+
+    def __repr__(self) -> str:
+        return f"<PumpedHydroStorage(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom}, p_nom_turbine={self.p_nom_turbine})>"
+
+
+class Battery(StorageComposite):
+    """
+    Composite class for battery storage.
+
+    A battery is a storage unit with direct electrical coupling (no separate generator).
+    Net power = dispatch - store (positive = discharging to bus).
+
+    Variable mapping:
+    - storage.p_in -> charge (charging the battery)
+    - storage.p_out -> discharge (discharging from battery)
+    - p (net) -> discharge - charge (electrical power to/from bus)
+
+    Parameters
+    ----------
+    name : str
+        Unique identifier for the battery
+    network : Network
+        Reference to the parent network
+    bus : Bus
+        Bus where the battery is connected
+    e_nom : float
+        Nominal energy capacity (MWh)
+    p_nom : float
+        Maximum power (MW) for both charge and discharge
+    eff_store : float, default 1.0
+        Charging efficiency
+    eff_dispatch : float, default 1.0
+        Discharging efficiency
+    initial_soc : float, default 0.0
+        Initial state of charge
+    soc_min : float, optional
+        Minimum SOC limit
+    soc_max : float, optional
+        Maximum SOC limit (defaults to e_nom)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        bus: "Bus",
+        e_nom: float,
+        p_nom: float,
+        eff_store: float = 1.0,
+        eff_dispatch: float = 1.0,
+        initial_soc: float = 0.0,
+        soc_min: float = None,
+        soc_max: float = None,
+    ):
+        super().__init__(name, network, bus)
+
+        # Store parameters for reference
+        self.e_nom = e_nom
+        self.p_nom = p_nom
+        self.eff_store = eff_store
+        self.eff_dispatch = eff_dispatch
+        self.initial_soc = initial_soc
+        self.soc_min = soc_min if soc_min is not None else 0.0
+        self.soc_max = soc_max if soc_max is not None else e_nom
+
+        # Create internal storage component (no generator for battery)
+        self._storage = self._create_storage()
+
+    def _create_storage(self) -> _StorageBase:
+        """Create the internal storage component."""
+        return _StorageBase(
+            name=self.name,
+            network=self.network,
+            bus=self.bus,
+            e_nom=self.e_nom,
+            p_nom_in=self.p_nom,  # p_in = charge
+            p_nom_out=self.p_nom,  # p_out = discharge
+            eff_in=self.eff_store,
+            eff_out=self.eff_dispatch,
+            initial_soc=self.initial_soc,
+            soc_min=self.soc_min,
+            soc_max=self.soc_max,
+            influx=0.0,  # No influx for battery
+        )
+
+    def setup_constraints(self, model):
+        """Setup constraints for storage."""
+        snapshots = self.network.snapshots
+        dim_name = snapshots.name
+
+        # Convert influx to pyoframe Param (0 for battery)
+        influx_df = snapshots.to_frame().with_columns(
+            pl.lit(0.0).alias("influx")
+        )
+        influx_param = pf.Param(influx_df)
+
+        # Setup core SOC constraints from base class
+        self._storage._setup_soc_constraints(model, influx_param)
+
+    def setup_objective(self, model):
+        """Delegate objective to internal storage (battery has no direct objective contribution)."""
+        self._storage.setup_objective(model)
+
+    def get_p_net(self):
+        """
+        Return net power injection for KCL.
+
+        Net power = dispatch - store
+        Positive = power injected into bus (discharging)
+        Negative = power withdrawn from bus (charging)
+        """
+        return self._storage.p_out - self._storage.p_in
+
+    # Property delegates for transparent access
+    @property
+    def p(self):
+        """Net electrical power (dispatch - store)."""
+        return self._storage.p_out - self._storage.p_in
+
+    @property
+    def p_store(self):
+        """Charging power (from storage.p_in)."""
+        return self._storage.p_in
+
+    @property
+    def p_dispatch(self):
+        """Discharging power (from storage.p_out)."""
+        return self._storage.p_out
+
+    def __repr__(self) -> str:
+        return f"<Battery(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom}, p_nom={self.p_nom})>"
