@@ -82,7 +82,7 @@ class TestPMinPuProfile:
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
         # Gen is forced at p_min_pu when its energy is unwanted.
-        p = gen.p_t["p"].to_list()
+        p = gen.sol.p_t["p"].to_list()
         assert [round(x, 6) for x in p] == [50.0, 30.0, 50.0, 30.0]
 
 
@@ -108,7 +108,7 @@ class TestRamping:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        gen_p = gen.p_t["p"].to_list()
+        gen_p = gen.sol.p_t["p"].to_list()
         # Ramp-up cap 10 MW/step starting from p(0)=0:
         # min cost is achieved by ramping as fast as possible.
         for i in range(1, 4):
@@ -135,7 +135,7 @@ class TestRamping:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        gen_p = gen.p_t["p"].to_list()
+        gen_p = gen.sol.p_t["p"].to_list()
         for i in range(1, 4):
             assert gen_p[i - 1] - gen_p[i] <= 10.0 + 1e-6
 
@@ -155,7 +155,7 @@ class TestRamping:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        gen_p = gen.p_t["p"].to_list()
+        gen_p = gen.sol.p_t["p"].to_list()
         # All four values must be identical (within float tolerance).
         assert max(gen_p) - min(gen_p) < 1e-6
 
@@ -180,7 +180,7 @@ class TestRamping:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        gen_p = gen.p_t["p"].to_list()
+        gen_p = gen.sol.p_t["p"].to_list()
         # Cap from profile (80, 60, 80, 60) and ramp from previous step
         # (start at <=80 since p(0)<=80 from profile, then +10 max).
         # The cheapest feasible path: ramp toward the cap as fast as possible.

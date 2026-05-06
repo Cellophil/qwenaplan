@@ -73,9 +73,9 @@ class TestStorageSOCDynamics:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        soc = s.soc_t["soc"].to_list()
-        p_in = s.p_in_t["p_in"].to_list()
-        p_out = s.p_out_t["p_out"].to_list()
+        soc = s.sol.soc_t["soc"].to_list()
+        p_in = s.sol.p_in_t["p_in"].to_list()
+        p_out = s.sol.p_out_t["p_out"].to_list()
 
         # t=0: soc(0) = initial_soc + (p_in(0) - p_out(0)) * Δt
         assert abs(soc[0] - (30.0 + p_in[0] - p_out[0])) < 1e-6
@@ -107,9 +107,9 @@ class TestStorageSOCDynamics:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        p_in = s.p_in_t["p_in"].to_list()
-        p_out = s.p_out_t["p_out"].to_list()
-        soc = s.soc_t["soc"].to_list()
+        p_in = s.sol.p_in_t["p_in"].to_list()
+        p_out = s.sol.p_out_t["p_out"].to_list()
+        soc = s.sol.soc_t["soc"].to_list()
         # Charge at t=0,1 (cheap), discharge at t=2,3 (expensive).
         assert p_in[0] > 0 or p_in[1] > 0
         assert p_out[2] > 0 or p_out[3] > 0
@@ -141,8 +141,8 @@ class TestStorageSOCDynamics:
         # At t=0 the optimal play is: free gen serves load (10 MW) AND
         # charges as much as it can — 20 MW total → 10 MW into storage at
         # eff_in 0.8 = 8 MWh added to SOC.
-        soc = s.soc_t["soc"].to_list()
-        p_in = s.p_in_t["p_in"].to_list()
+        soc = s.sol.soc_t["soc"].to_list()
+        p_in = s.sol.p_in_t["p_in"].to_list()
         # SOC at t=0 = initial + p_in[0]*eff_in*Δt = 0 + 10*0.8*1 = 8
         assert abs(soc[0] - p_in[0] * 0.8) < 1e-6
 
@@ -168,6 +168,6 @@ class TestStorageBoundsAreEnforced:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        soc = storage.soc_t["soc"].to_list()
+        soc = storage.sol.soc_t["soc"].to_list()
         for s in soc:
             assert s >= 20.0 - 1e-6

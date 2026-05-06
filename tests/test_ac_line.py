@@ -51,7 +51,7 @@ class TestACLinePhysics:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        assert line.p_t["p"].to_list() == [40.0, 40.0, 40.0, 40.0]
+        assert line.sol.p_t["p"].to_list() == [40.0, 40.0, 40.0, 40.0]
 
     def test_parallel_lines_split_flow_inverse_to_reactance(self, snapshots):
         """Two lines in parallel between bus1 and bus2 with x_pu = 0.1 and
@@ -69,8 +69,8 @@ class TestACLinePhysics:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        flow_a = line_a.p_t["p"].to_list()
-        flow_b = line_b.p_t["p"].to_list()
+        flow_a = line_a.sol.p_t["p"].to_list()
+        flow_b = line_b.sol.p_t["p"].to_list()
         # Each snapshot: 30 + 10 = 40 MW, ratio 3:1.
         for fa, fb in zip(flow_a, flow_b):
             assert abs(fa - 30.0) < 1e-6
@@ -102,4 +102,4 @@ class TestACLinePhysics:
         n.set_snapshots(snapshots)
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
-        assert line.p_t["p"].to_list() == [5000.0] * 4
+        assert line.sol.p_t["p"].to_list() == [5000.0] * 4

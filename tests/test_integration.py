@@ -29,9 +29,9 @@ class TestEndToEnd:
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
         # Cheap covers everything; line carries 40 MW from bus1 → bus2.
-        assert n.generators["Cheap"].p_t["p"].to_list() == [40.0] * 4
-        assert n.generators["Expensive"].p_t["p"].to_list() == [0.0] * 4
-        assert line.p_t["p"].to_list() == [40.0] * 4
+        assert n.generators["Cheap"].sol.p_t["p"].to_list() == [40.0] * 4
+        assert n.generators["Expensive"].sol.p_t["p"].to_list() == [0.0] * 4
+        assert line.sol.p_t["p"].to_list() == [40.0] * 4
         # Cost: 4 × 40 × 10 = 1600.
         assert n.objective_value == 1600.0
 
@@ -47,7 +47,7 @@ class TestEndToEnd:
 
         # Total generation must equal total load every snapshot.
         for t in range(4):
-            total_gen = gen1.p_t["p"][t] + gen2.p_t["p"][t]
+            total_gen = gen1.sol.p_t["p"][t] + gen2.sol.p_t["p"][t]
             assert abs(total_gen - 30.0) < 1e-6
 
     def test_objective_tracks_marginal_cost_changes(self, snapshots):
@@ -93,9 +93,9 @@ class TestSnapshotDurationAndWeighting:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        soc0 = s.soc_t["soc"].to_list()[0]
-        p_in0 = s.p_in_t["p_in"].to_list()[0]
-        p_out0 = s.p_out_t["p_out"].to_list()[0]
+        soc0 = s.sol.soc_t["soc"].to_list()[0]
+        p_in0 = s.sol.p_in_t["p_in"].to_list()[0]
+        p_out0 = s.sol.p_out_t["p_out"].to_list()[0]
         # SOC at t=0 = initial_soc + (p_in - p_out) * duration
         # = 0 + (p_in0 - p_out0) * 6
         assert abs(soc0 - (p_in0 - p_out0) * 6.0) < 1e-6

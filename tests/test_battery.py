@@ -80,14 +80,14 @@ class TestBatteryDispatch:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        p_store = b.p_store_t["p_store"].to_list()
-        p_dispatch = b.p_dispatch_t["p_dispatch"].to_list()
+        p_store = b.sol.p_store_t["p_store"].to_list()
+        p_dispatch = b.sol.p_dispatch_t["p_dispatch"].to_list()
         # Charge in cheap window, discharge in expensive.
         assert p_store[0] > 0 or p_store[1] > 0
         assert p_dispatch[2] > 0 or p_dispatch[3] > 0
 
     def test_p_t_returns_dispatch_minus_store(self, snapshots):
-        """Battery.p_t must equal p_dispatch_t - p_store_t per snapshot."""
+        """``battery.sol.p_t`` must equal ``sol.p_dispatch_t - sol.p_store_t`` per snapshot."""
         n = qp.Network()
         bus = n.add(qp.Bus, "Bus")
         n.add(qp.Generator, "Cheap", bus=bus, p_nom=100.0,
@@ -102,9 +102,9 @@ class TestBatteryDispatch:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        p_net = b.p_t["p"].to_list()
-        p_store = b.p_store_t["p_store"].to_list()
-        p_dispatch = b.p_dispatch_t["p_dispatch"].to_list()
+        p_net = b.sol.p_t["p"].to_list()
+        p_store = b.sol.p_store_t["p_store"].to_list()
+        p_dispatch = b.sol.p_dispatch_t["p_dispatch"].to_list()
         for i in range(4):
             assert abs(p_net[i] - (p_dispatch[i] - p_store[i])) < 1e-6
 
@@ -127,6 +127,6 @@ class TestBatteryDispatch:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        soc = b.soc_t["soc"].to_list()
+        soc = b.sol.soc_t["soc"].to_list()
         for s in soc:
             assert 20.0 - 1e-6 <= s <= 80.0 + 1e-6

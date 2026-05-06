@@ -45,7 +45,7 @@ class TestLinkOptimization:
         """A 30 MW load at bus2 must be served from gen at bus1 via the Link.
 
         With no AC line between them, the Link is the only path: solving the
-        problem must yield link.p_t == 30 MW for every snapshot.
+        problem must yield link.sol.p_t == 30 MW for every snapshot.
         """
         n = qp.Network()
         bus1 = n.add(qp.Bus, "Bus1")
@@ -59,11 +59,11 @@ class TestLinkOptimization:
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
         # Link from bus1 → bus2 is carrying the full demand each snapshot.
-        flows = link.p_t["p"].to_list()
+        flows = link.sol.p_t["p"].to_list()
         assert flows == [30.0, 30.0, 30.0, 30.0]
 
         # Generator covers exactly that demand (no other sinks/sources).
-        gen_p = gen.p_t["p"].to_list()
+        gen_p = gen.sol.p_t["p"].to_list()
         assert gen_p == [30.0, 30.0, 30.0, 30.0]
 
     def test_link_capacity_binds(self, snapshots):

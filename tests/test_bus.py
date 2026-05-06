@@ -46,7 +46,8 @@ class TestBusVariables:
     """Test variable creation for Bus."""
     
     def test_variables_created(self, network, snapshots):
-        """Bus creates a theta variable on instance after set_snapshots.
+        """Bus creates a ``var.theta_t`` variable on the instance after
+        ``set_snapshots``.
 
         There is intentionally no p_net slack variable any more — KCL is
         closed via Generators / Loads / Storage. theta is the only Bus-owned
@@ -55,6 +56,8 @@ class TestBusVariables:
         bus = network.add(pypsa.Bus, "Bus1", v_nom=1.0)
         network.set_snapshots(snapshots)
 
-        assert hasattr(bus, "theta")
+        # var.theta_t is the canonical home (the bare ``bus.theta`` name is gone).
+        assert hasattr(bus.var, "theta_t")
         # Sanity: confirm the slack is actually gone.
         assert not hasattr(bus, "p_net")
+        assert not hasattr(bus.var, "p_net_t")

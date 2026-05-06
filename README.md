@@ -49,10 +49,39 @@ n.create_model()        # vars, constraints, objective from marginal_cost × dur
 status = n.optimize()   # returns pyoptinterface TerminationStatusCode
 
 # Inspect
-print(n.objective_value)            # total annualised cost
-print(n.generators["Cheap"].p_t)    # tidy DataFrame keyed by snapshot
-print(line.p_t)                      # line flow per snapshot (from_bus → to_bus)
+print(n.objective_value)                       # total annualised cost
+print(n.generators["Cheap"].sol.p_t)           # tidy DataFrame keyed by snapshot
+print(n.generators["Cheap"].sol.p_pu_t)        # capacity factor (p / p_nom)
+print(line.sol.p_t)                            # line flow per snapshot (from_bus → to_bus)
 ```
+
+### Two containers per component: `var` and `sol`
+
+Every component holds two namespaces for its time-vectorized fields:
+
+- **`obj.var.<name>_t`** — pyoframe `Variable` / expression. Use this when
+  building custom constraints or terms in the objective.
+- **`obj.sol.<name>_t`** — solved value as a tidy Polars DataFrame
+  (snapshot index + value column).
+
+The `_t` suffix marks "vector over snapshots". Static parameters
+(`p_nom`, `marginal_cost`, `e_nom`, `x_pu`, …) stay on the component
+itself — they're not vectorized.
+
+```python
+gen.var.p_t * gen.marginal_cost           # used in a custom constraint / objective
+gen.sol.p_t                                # solved DataFrame after optimize()
+gen.sol.p_pu_t                             # = gen.sol.p_t / gen.p_nom
+
+storage.var.soc_pu_t <= 0.8                # capacity-fraction cap (var side, no new vars)
+storage.sol.p_pu_t                         # net power as fraction of nameplate
+battery.sol.soc_pu_t                       # fill level
+phs.sol.p_pu_t                             # turbine output as fraction of p_nom_turbine
+```
+
+`Load` is the one asymmetry: it has no decision variable (`p_set` is
+parameter data), so there is no `load.var`. `load.sol.p_t` returns the
+parameter and is available **before** solving too.
 
 ### Components
 

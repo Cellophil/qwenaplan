@@ -75,8 +75,8 @@ class TestPumpedHydroCoupling:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        p_gen = phs.p_t["p"].to_list()
-        p_disp = phs.p_dispatch_t["p_dispatch"].to_list()
+        p_gen = phs.sol.p_t["p"].to_list()
+        p_disp = phs.sol.p_dispatch_t["p_dispatch"].to_list()
         for g, d in zip(p_gen, p_disp):
             assert abs(g - d * 0.9) < 1e-6
 
@@ -128,7 +128,7 @@ class TestPumpedHydroCoupling:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        soc = phs.soc_t["soc"].to_list()
+        soc = phs.sol.soc_t["soc"].to_list()
         # No pumping (p_nom_pump=0), no influx → SOC monotone non-increasing.
         for i in range(1, len(soc)):
             assert soc[i] <= soc[i - 1] + 1e-6

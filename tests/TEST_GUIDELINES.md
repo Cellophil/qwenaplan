@@ -9,11 +9,12 @@ the file remains scannable.
 n = qp.Network()
 # ... add(Bus / Generator / Load / Line / Link / Storage) ...
 n.set_snapshots(snapshots, duration=1.0, weighting=1.0)
-n.create_model()           # builds variables, constraints, objective
-status = n.optimize()      # returns pyoptinterface TerminationStatusCode
+n.create_model()                  # builds variables, constraints, objective
+status = n.optimize()             # returns pyoptinterface TerminationStatusCode
 assert status == poi.TerminationStatusCode.OPTIMAL
-gen.p_t["p"].to_list()     # read solution
-n.objective_value           # total cost
+gen.sol.p_t["p"].to_list()        # read solution (sol = solved values)
+gen.var.p_t * gen.marginal_cost   # build a custom constraint expression (var = symbolic)
+n.objective_value                  # total cost
 ```
 
 Three things that used to be the norm and are now wrong:
@@ -83,22 +84,37 @@ What we don't keep:
 
 ## Reading solutions
 
-Every component exposes `<var>_t` properties that return Polars frames
-keyed by snapshot:
+Solved values live on `obj.sol.<name>_t` and return Polars frames keyed
+by snapshot:
 
 ```python
-gen.p_t           # cols: time, p
-load.p_t          # cols: time, p (parameter, available pre-solve too)
-line.p_t          # cols: time, p
-storage.soc_t     # cols: time, soc
-storage.p_in_t    # cols: time, p_in
-battery.p_t       # cols: time, p   (computed: p_dispatch - p_store)
-phs.p_t           # cols: time, p   (= generator.p)
-phs.p_dispatch_t  # cols: time, p_dispatch
+gen.sol.p_t           # cols: time, p
+gen.sol.p_pu_t        # cols: time, p_pu      (= p / p_nom)
+load.sol.p_t          # cols: time, p         (parameter, available pre-solve too)
+line.sol.p_t          # cols: time, p
+storage.sol.soc_t     # cols: time, soc
+storage.sol.soc_pu_t  # cols: time, soc_pu    (= soc / e_nom)
+storage.sol.p_in_t    # cols: time, p_in
+storage.sol.p_pu_t    # cols: time, p_pu      (net = (p_out - p_in) / nameplate)
+battery.sol.p_t       # cols: time, p         (computed: p_dispatch - p_store)
+phs.sol.p_t           # cols: time, p         (= generator.var.p_t)
+phs.sol.p_dispatch_t  # cols: time, p_dispatch
 ```
 
-Use these instead of `gen.p.solution["solution"].to_list()` — same data,
-clearer intent.
+Symbolic counterparts (use these for custom constraints / objective
+terms — no new variables introduced):
+
+```python
+gen.var.p_t            # pyoframe Variable
+gen.var.p_pu_t         # pyoframe expression
+storage.var.soc_pu_t   # = soc_t / e_nom (expression)
+storage.var.p_pu_t     # = (p_out_t - p_in_t) / nameplate (expression)
+n.model.cap = storage.var.soc_pu_t <= 0.8     # caps SOC at 80% of e_nom
+```
+
+Use these instead of `gen.var.p_t.solution["solution"].to_list()` —
+same data, clearer intent. `Load` has no `var` (parameter, no decision
+variable); only `load.sol.p_t`.
 
 ## Termination status
 

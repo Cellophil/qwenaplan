@@ -76,8 +76,8 @@ class TestGeneratorDispatch:
             [(50.0, 10.0), (100.0, 50.0)],
             load_p_set=70.0,
         )
-        assert cheap.p_t["p"].to_list() == [50.0] * 4
-        assert expensive.p_t["p"].to_list() == [20.0] * 4
+        assert cheap.sol.p_t["p"].to_list() == [50.0] * 4
+        assert expensive.sol.p_t["p"].to_list() == [20.0] * 4
         # Objective: 4 snapshots × (50×10 + 20×50) = 4 × 1500 = 6000.
         assert n.objective_value == 6000.0
 
@@ -90,8 +90,8 @@ class TestGeneratorDispatch:
              (100.0, 50.0)],
             load_p_set=70.0,
         )
-        assert cheap.p_t["p"].to_list() == [50.0] * 4
-        assert expensive.p_t["p"].to_list() == [20.0] * 4
+        assert cheap.sol.p_t["p"].to_list() == [50.0] * 4
+        assert expensive.sol.p_t["p"].to_list() == [20.0] * 4
 
     def test_p_min_pu_forces_minimum_output(self, snapshots):
         """If a cheap gen has p_min_pu=0.3 and load only 20 MW, the cheap gen
@@ -110,8 +110,8 @@ class TestGeneratorDispatch:
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
         # Cheap is at minimum 30 MW (forced); load is 20 → absorber is -10.
-        assert cheap.p_t["p"].to_list() == [30.0] * 4
-        assert absorber.p_t["p"].to_list() == [-10.0] * 4
+        assert cheap.sol.p_t["p"].to_list() == [30.0] * 4
+        assert absorber.sol.p_t["p"].to_list() == [-10.0] * 4
 
     def test_p_max_pu_profile_varies_per_snapshot(self, snapshots):
         """A renewable profile of [0.1, 0.5, 0.8, 0.0] times p_nom=100 must
@@ -129,8 +129,8 @@ class TestGeneratorDispatch:
         n.create_model()
         assert n.optimize() == poi.TerminationStatusCode.OPTIMAL
 
-        renew_p = renew.p_t["p"].to_list()
-        backup_p = backup.p_t["p"].to_list()
+        renew_p = renew.sol.p_t["p"].to_list()
+        backup_p = backup.sol.p_t["p"].to_list()
         assert renew_p == [10.0, 50.0, 80.0, 0.0]
         assert backup_p == [90.0, 50.0, 20.0, 100.0]
 
