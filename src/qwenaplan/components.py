@@ -757,15 +757,6 @@ class StorageComposite(ABC):
         """Access the internal generator component (if any)."""
         return self._generator
 
-    @abstractmethod
-    def _create_storage(self) -> _StorageBase:
-        """Create and configure the internal storage component."""
-        pass
-
-    def _create_generator(self) -> Generator | None:
-        """Create generator if needed. Override in subclasses."""
-        return None
-
     def setup_variables(self):
         """Setup variables for all internal components."""
         self._storage.setup_variables()
@@ -867,47 +858,83 @@ class PumpedHydroStorage(StorageComposite):
     ):
         super().__init__(name, network, bus)
 
-        # Store parameters for reference
-        self.e_nom = e_nom
-        self.p_nom_turbine = p_nom_turbine
-        self.p_nom_pump = p_nom_pump
-        self.eff_store = eff_store
-        self.eff_dispatch = eff_dispatch
+        # gen_efficiency couples storage outflow to electrical output and is
+        # owned by this composite (not by the inner storage), so it stays a
+        # plain attribute. Everything else is delegated to the inner storage.
         self.gen_efficiency = gen_efficiency
-        self.initial_soc = initial_soc
-        self.soc_min = soc_min if soc_min is not None else 0.0
-        self.soc_max = soc_max if soc_max is not None else e_nom
-        self.influx = influx
 
-        # Create internal components
-        self._storage = self._create_storage()
-        self._generator = self._create_generator()
-
-    def _create_storage(self) -> _StorageBase:
-        """Create the internal storage component (reservoir)."""
-        return _StorageBase(
-            name=f"{self.name}_storage",
-            network=self.network,
-            bus=self.bus,
-            e_nom=self.e_nom,
-            p_nom_in=self.p_nom_pump,  # p_in = pump
-            p_nom_out=self.p_nom_turbine,  # p_out = water dispatch
-            eff_in=self.eff_store,
-            eff_out=self.eff_dispatch,
-            initial_soc=self.initial_soc,
-            soc_min=self.soc_min,
-            soc_max=self.soc_max,
-            influx=self.influx,
+        # Build the inner storage as the single source of truth for shared
+        # parameters. User mutations on this composite (e.g. ``phs.soc_min = 5``)
+        # propagate via property setters below.
+        self._storage = _StorageBase(
+            name=f"{name}_storage",
+            network=network,
+            bus=bus,
+            e_nom=e_nom,
+            p_nom_in=p_nom_pump,        # p_in = pump
+            p_nom_out=p_nom_turbine,    # p_out = water dispatch
+            eff_in=eff_store,
+            eff_out=eff_dispatch,
+            initial_soc=initial_soc,
+            soc_min=soc_min,
+            soc_max=soc_max,
+            influx=influx,
+        )
+        self._generator = Generator(
+            name=f"{name}_generator",
+            network=network,
+            bus=bus,
+            p_nom=p_nom_turbine,
         )
 
-    def _create_generator(self) -> Generator:
-        """Create the internal generator component (turbine + generator)."""
-        return Generator(
-            name=f"{self.name}_generator",
-            network=self.network,
-            bus=self.bus,
-            p_nom=self.p_nom_turbine,
-        )
+    # Property delegates: composite reads/writes flow into the inner storage
+    # / generator. Mutations remain visible at create_model() time.
+    @property
+    def e_nom(self): return self._storage.e_nom
+    @e_nom.setter
+    def e_nom(self, v): self._storage.e_nom = v
+
+    @property
+    def p_nom_pump(self): return self._storage.p_nom_in
+    @p_nom_pump.setter
+    def p_nom_pump(self, v): self._storage.p_nom_in = v
+
+    @property
+    def p_nom_turbine(self): return self._storage.p_nom_out
+    @p_nom_turbine.setter
+    def p_nom_turbine(self, v):
+        self._storage.p_nom_out = v
+        self._generator.p_nom = v
+
+    @property
+    def eff_store(self): return self._storage.eff_in
+    @eff_store.setter
+    def eff_store(self, v): self._storage.eff_in = v
+
+    @property
+    def eff_dispatch(self): return self._storage.eff_out
+    @eff_dispatch.setter
+    def eff_dispatch(self, v): self._storage.eff_out = v
+
+    @property
+    def initial_soc(self): return self._storage.initial_soc
+    @initial_soc.setter
+    def initial_soc(self, v): self._storage.initial_soc = v
+
+    @property
+    def soc_min(self): return self._storage.soc_min
+    @soc_min.setter
+    def soc_min(self, v): self._storage.soc_min = v
+
+    @property
+    def soc_max(self): return self._storage.soc_max
+    @soc_max.setter
+    def soc_max(self, v): self._storage.soc_max = v
+
+    @property
+    def influx(self): return self._storage._influx
+    @influx.setter
+    def influx(self, v): self._storage._influx = v
 
     def setup_constraints(self, model):
         """Setup constraints for storage and generator coupling."""
@@ -1024,34 +1051,65 @@ class Battery(StorageComposite):
     ):
         super().__init__(name, network, bus)
 
-        # Store parameters for reference
-        self.e_nom = e_nom
-        self.p_nom = p_nom
-        self.eff_store = eff_store
-        self.eff_dispatch = eff_dispatch
-        self.initial_soc = initial_soc
-        self.soc_min = soc_min if soc_min is not None else 0.0
-        self.soc_max = soc_max if soc_max is not None else e_nom
-
-        # Create internal storage component (no generator for battery)
-        self._storage = self._create_storage()
-
-    def _create_storage(self) -> _StorageBase:
-        """Create the internal storage component."""
-        return _StorageBase(
-            name=self.name,
-            network=self.network,
-            bus=self.bus,
-            e_nom=self.e_nom,
-            p_nom_in=self.p_nom,  # p_in = charge
-            p_nom_out=self.p_nom,  # p_out = discharge
-            eff_in=self.eff_store,
-            eff_out=self.eff_dispatch,
-            initial_soc=self.initial_soc,
-            soc_min=self.soc_min,
-            soc_max=self.soc_max,
+        # Create the internal storage component eagerly with the supplied
+        # parameters. From here on, all of (e_nom, p_nom, eff_*, initial_soc,
+        # soc_min, soc_max) are owned by self._storage and surfaced via
+        # properties on this composite. This means user mutations like
+        # ``battery.soc_min = 20`` after construction are visible to the SOC
+        # constraint at create_model() time, where they actually matter.
+        self._storage = _StorageBase(
+            name=name,
+            network=network,
+            bus=bus,
+            e_nom=e_nom,
+            p_nom_in=p_nom,   # p_in = charge
+            p_nom_out=p_nom,  # p_out = discharge
+            eff_in=eff_store,
+            eff_out=eff_dispatch,
+            initial_soc=initial_soc,
+            soc_min=soc_min,
+            soc_max=soc_max,
             influx=0.0,  # No influx for battery
         )
+
+    # Property delegates so attribute mutations (and reads) on the composite
+    # always go through the inner storage — no risk of stale duplicate state.
+    @property
+    def e_nom(self): return self._storage.e_nom
+    @e_nom.setter
+    def e_nom(self, v): self._storage.e_nom = v
+
+    @property
+    def p_nom(self): return self._storage.p_nom_in  # in == out for battery
+    @p_nom.setter
+    def p_nom(self, v):
+        self._storage.p_nom_in = v
+        self._storage.p_nom_out = v
+
+    @property
+    def eff_store(self): return self._storage.eff_in
+    @eff_store.setter
+    def eff_store(self, v): self._storage.eff_in = v
+
+    @property
+    def eff_dispatch(self): return self._storage.eff_out
+    @eff_dispatch.setter
+    def eff_dispatch(self, v): self._storage.eff_out = v
+
+    @property
+    def initial_soc(self): return self._storage.initial_soc
+    @initial_soc.setter
+    def initial_soc(self, v): self._storage.initial_soc = v
+
+    @property
+    def soc_min(self): return self._storage.soc_min
+    @soc_min.setter
+    def soc_min(self, v): self._storage.soc_min = v
+
+    @property
+    def soc_max(self): return self._storage.soc_max
+    @soc_max.setter
+    def soc_max(self, v): self._storage.soc_max = v
 
     def setup_constraints(self, model):
         """Setup constraints for storage. Battery has no influx (set at __init__)."""
