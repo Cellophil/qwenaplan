@@ -25,6 +25,16 @@ class Network:
         self.batteries: Dict[str, Battery] = {}
 
         self.snapshots = None
+        # Per-snapshot timing (filled by set_snapshots/set_snapshot_durations):
+        # - snapshot_duration[t]: physical length of snapshot t (hours).
+        #   Multiplies storage SOC dynamics (energy = power × duration) and
+        #   the objective (cost = price × power × duration).
+        # - snapshot_weighting[t]: how many physical occurrences of t the
+        #   model represents (e.g. 365 for a "typical day" in a yearly
+        #   model). Multiplies the objective only — SOC dynamics see the
+        #   single physical occurrence.
+        self.snapshot_duration: pl.Series = None
+        self.snapshot_weighting: pl.Series = None
         self.model = None
         self._is_locked = False
 
@@ -66,12 +76,42 @@ class Network:
         registry[name] = obj
         return obj
 
-    def set_snapshots(self, snapshots: pl.Series):
-        """Define the time axis and trigger variable creation."""
+    def set_snapshots(
+        self,
+        snapshots: pl.Series,
+        duration: float | pl.Series = 1.0,
+        weighting: float | pl.Series = 1.0,
+    ):
+        """Define the time axis and trigger variable creation.
+
+        Parameters
+        ----------
+        snapshots : pl.Series
+            Snapshot index. The series ``.name`` becomes the time-dimension
+            name used throughout pyoframe expressions.
+        duration : float | pl.Series, default 1.0
+            Hours represented by each snapshot. Scalar broadcasts. Used by
+            storage SOC dynamics (energy gained = power × duration) and the
+            objective (cost = marginal_cost × p × duration × weighting).
+        weighting : float | pl.Series, default 1.0
+            Occurrence multiplier (e.g. 365 for a representative day in a
+            yearly model). Multiplies objective contributions only, never
+            the SOC equation.
+        """
         if self._is_locked:
             raise RuntimeError("Network is locked.")
 
         self.snapshots = snapshots
+        n = len(snapshots)
+        self.snapshot_duration = (
+            duration if isinstance(duration, pl.Series)
+            else pl.Series("snapshot_duration", [float(duration)] * n)
+        )
+        self.snapshot_weighting = (
+            weighting if isinstance(weighting, pl.Series)
+            else pl.Series("snapshot_weighting", [float(weighting)] * n)
+        )
+
         # Trigger all components to initialize their pyoframe variables
         all_components = {
             **self.buses,
@@ -85,6 +125,32 @@ class Network:
         }.values()
         for comp in all_components:
             comp.setup_variables()
+
+    def _snapshot_duration_param(self) -> pf.Param:
+        """Build a pyoframe Param of per-snapshot durations (hours)."""
+        df = self.snapshots.to_frame().with_columns(
+            self.snapshot_duration.alias("duration")
+        )
+        return pf.Param(df)
+
+    def _snapshot_weighting_param(self) -> pf.Param:
+        """Build a pyoframe Param of per-snapshot occurrence counts."""
+        df = self.snapshots.to_frame().with_columns(
+            self.snapshot_weighting.alias("weighting")
+        )
+        return pf.Param(df)
+
+    def _objective_cost_weight_param(self) -> pf.Param:
+        """Build a Param of duration × weighting per snapshot.
+
+        Components that contribute to the objective (e.g. Generator marginal
+        cost) multiply their per-snapshot expression by this so a single
+        ``.sum()`` at the network level produces honest annualised cost.
+        """
+        df = self.snapshots.to_frame().with_columns(
+            (self.snapshot_duration * self.snapshot_weighting).alias("cost_weight")
+        )
+        return pf.Param(df)
 
     def get_connected_power_elements(self, bus: "Bus"):
         """Returns all generators/loads/storage connected to the given bus."""

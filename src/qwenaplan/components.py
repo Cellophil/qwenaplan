@@ -262,12 +262,13 @@ class Generator(PowerElement):
                 )
 
     def setup_objective(self, network):
-        # Add marginal cost contribution: p(t) * marginal_cost, summed by Network.
-        # Snapshot duration/weighting (Tier 0 plan_05) will be applied by the
-        # Network when it sums contributions; until then this is per-snapshot
-        # cost (matching the previous implicit convention).
+        # Annualised marginal cost contribution per snapshot:
+        #   p(t) * marginal_cost * duration(t) * weighting(t)
+        # Defaults of duration=1, weighting=1 reproduce the previous
+        # per-snapshot cost convention exactly.
         if self.marginal_cost != 0:
-            network._add_to_objective(self.p * self.marginal_cost)
+            cost_weight = network._objective_cost_weight_param()
+            network._add_to_objective(self.p * self.marginal_cost * cost_weight)
 
     @property
     def p_t(self) -> pl.DataFrame:
@@ -552,45 +553,71 @@ class _StorageBase(PowerElement):
         """Storage base has no direct contribution to the objective function."""
         pass
 
-    def _setup_soc_constraints(self, model, influx_param: pf.Param):
+    def _setup_soc_constraints(self, model):
         """
         Setup SOC balance and bounds constraints.
-        
-        This is the core storage logic that all storage types share.
-        
-        Parameters
-        ----------
-        model : pf.Model
-            The optimization model
-        influx_param : pf.Param
-            Time-series influx parameter
+
+        This is the core storage logic that all storage types share. The
+        balance is in **energy units** (MWh), so each power term is multiplied
+        by the snapshot duration (hours) of the *destination* snapshot. With
+        the default duration of 1.0 the equation matches the historical
+        per-snapshot form.
+
+        ``self._influx_series`` (set in ``setup_variables``) is the source of
+        truth for influx; subclasses configure it via ``influx`` /
+        ``set_influx_profile`` rather than passing a separate Param.
         """
         snapshots = self.network.snapshots
         dim_name = snapshots.name
+        # Pre-multiply influx by duration in polars so we work with a single
+        # *energy-per-snapshot* Param. This avoids needing to multiply
+        # Param×Param at pyoframe level, which is awkward across .next()/.drop_extras().
+        duration_series = self.network.snapshot_duration
 
-        # 1. SOC Balance Equation (PyPSA convention)
-        # Note: .next() shifts values forward, so soc.next() has one fewer element than soc.
-        # We apply .drop_extras() to the soc term on the right side to align dimensions.
-        # influx_param is a Param (not a Variable), so we use .drop_extras() instead of .next()
+        # 1. SOC Balance Equation (PyPSA convention; energy units)
+        #    soc(t+1) = soc(t) + p_in(t+1)*eff_in*Δt(t+1)
+        #             - p_out(t+1)/eff_out*Δt(t+1)
+        #             + influx(t+1)*Δt(t+1)
+        # Variables: .next() shifts to t+1 values.
+        # Params: pyoframe aligns by index when added; .drop_extras() projects
+        # onto the constraint dimension. We construct each per-step Param
+        # already pre-multiplied by Δt to keep the algebra linear in pyoframe.
+        delta_t_per_in = self.eff_in * duration_series
+        delta_t_per_out = duration_series / self.eff_out
+        df_in = snapshots.to_frame().with_columns(delta_t_per_in.alias("k"))
+        df_out = snapshots.to_frame().with_columns(delta_t_per_out.alias("k"))
+        eff_in_dt = pf.Param(df_in)
+        eff_out_dt = pf.Param(df_out)
+        # influx is in MW; multiply by duration to get MWh per snapshot.
+        influx_energy_df = (
+            snapshots.to_frame()
+            .with_columns(self._influx_series.alias("influx"))
+            .with_columns(duration_series.alias("dt"))
+            .with_columns((pl.col("influx") * pl.col("dt")).alias("e_influx"))
+            .select([snapshots.name, "e_influx"])
+        )
+        influx_energy_param = pf.Param(influx_energy_df)
+
         soc_balance = (
             self.soc.next(dim_name)
             == (
                 self.soc.drop_extras()
-                + self.p_in.next(dim_name) * self.eff_in
-                - self.p_out.next(dim_name) / self.eff_out
-                + influx_param.drop_extras()
+                + self.p_in.next(dim_name) * eff_in_dt.drop_extras()
+                - self.p_out.next(dim_name) * eff_out_dt.drop_extras()
+                + influx_energy_param.drop_extras()
             )
         )
         setattr(model, f"soc_balance_{self.name}", soc_balance)
 
-        # 2. Initial SOC constraint
+        # 2. Initial SOC constraint (first snapshot's own Δt).
         first_snapshot = snapshots[0]
+        first_filter = pl.col(snapshots.name) == first_snapshot
         initial_soc_constraint = (
-            self.soc.filter(pl.col(snapshots.name) == first_snapshot)
+            self.soc.filter(first_filter)
             == self.initial_soc
-            + self.p_in.filter(pl.col(snapshots.name) == first_snapshot) * self.eff_in
-            - self.p_out.filter(pl.col(snapshots.name) == first_snapshot) / self.eff_out
-            + influx_param.filter(pl.col(snapshots.name) == first_snapshot)
+            + self.p_in.filter(first_filter) * eff_in_dt.filter(first_filter)
+            - self.p_out.filter(first_filter) * eff_out_dt.filter(first_filter)
+            + influx_energy_param.filter(first_filter)
         )
         setattr(model, f"initial_soc_{self.name}", initial_soc_constraint)
 
@@ -611,25 +638,8 @@ class _StorageBase(PowerElement):
         setattr(model, f"soc_max_{self.name}", self.soc <= self.soc_max)
 
     def setup_constraints(self, model):
-        """
-        Setup constraints for storage.
-        
-        Default implementation that can be used directly or overridden by subclasses.
-        """
-        snapshots = self.network.snapshots
-        dim_name = snapshots.name
-
-        # Convert influx to pyoframe Param
-        if dim_name in self._influx_series.name:
-            influx_df = self._influx_series.to_frame()
-        else:
-            influx_df = self.network.snapshots.to_frame().with_columns(
-                pl.lit(self._influx).alias("influx")
-            )
-        influx_param = pf.Param(influx_df)
-
-        # Setup core SOC constraints
-        self._setup_soc_constraints(model, influx_param)
+        """Default storage constraints. Subclasses can override if needed."""
+        self._setup_soc_constraints(model)
 
     def get_p_net(self):
         """
@@ -669,21 +679,8 @@ class StorageUnit(_StorageBase):
     """
 
     def setup_constraints(self, model):
-        """Add constraints to the optimization model."""
-        snapshots = self.network.snapshots
-        dim_name = snapshots.name
-
-        # Convert influx to pyoframe Param
-        if dim_name in self._influx_series.name:
-            influx_df = self._influx_series.to_frame()
-        else:
-            influx_df = self.network.snapshots.to_frame().with_columns(
-                pl.lit(self._influx).alias("influx")
-            )
-        influx_param = pf.Param(influx_df)
-
-        # Setup core SOC constraints
-        self._setup_soc_constraints(model, influx_param)
+        """StorageUnit-specific constraints. Same physics as the base class."""
+        self._setup_soc_constraints(model)
 
     def get_p_net(self):
         """
@@ -914,18 +911,9 @@ class PumpedHydroStorage(StorageComposite):
 
     def setup_constraints(self, model):
         """Setup constraints for storage and generator coupling."""
-        # Setup storage SOC constraints (reuses base class logic)
-        snapshots = self.network.snapshots
-        dim_name = snapshots.name
-
-        # Convert influx to pyoframe Param
-        influx_df = snapshots.to_frame().with_columns(
-            pl.lit(self.influx).alias("influx")
-        )
-        influx_param = pf.Param(influx_df)
-
-        # Setup core SOC constraints from base class
-        self._storage._setup_soc_constraints(model, influx_param)
+        # Storage SOC constraints (reuses base class logic; influx already on
+        # the inner _StorageBase via __init__).
+        self._storage._setup_soc_constraints(model)
 
         # Setup generator constraints
         self._generator.setup_constraints(model)
@@ -1066,18 +1054,8 @@ class Battery(StorageComposite):
         )
 
     def setup_constraints(self, model):
-        """Setup constraints for storage."""
-        snapshots = self.network.snapshots
-        dim_name = snapshots.name
-
-        # Convert influx to pyoframe Param (0 for battery)
-        influx_df = snapshots.to_frame().with_columns(
-            pl.lit(0.0).alias("influx")
-        )
-        influx_param = pf.Param(influx_df)
-
-        # Setup core SOC constraints from base class
-        self._storage._setup_soc_constraints(model, influx_param)
+        """Setup constraints for storage. Battery has no influx (set at __init__)."""
+        self._storage._setup_soc_constraints(model)
 
     def setup_objective(self, network):
         """Delegate objective to internal storage (battery has no direct objective contribution)."""
