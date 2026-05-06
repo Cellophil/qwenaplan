@@ -89,9 +89,12 @@ class ACLine(BranchElement):
         # 1. Apply KVL to link this line's flow to bus angles
         DCPhysics.apply_kirchhoff_voltage_law(self, model)
 
-        # 2. Add thermal limits (if defined)
+        # 2. Add thermal limits (if defined). Two separate constraints —
+        # Python's chained comparison ``a <= x <= b`` silently discards one
+        # half when the operands are pyoframe objects, so we split them.
         if self.s_nom > 0:
-            setattr(model, f"line_limit_{self.name}", -self.s_nom <= self.p <= self.s_nom)
+            setattr(model, f"line_limit_upper_{self.name}", self.p <= self.s_nom)
+            setattr(model, f"line_limit_lower_{self.name}", self.p >= -self.s_nom)
 
     def setup_objective(self, network):
         # ACLine has no direct contribution to the objective function
@@ -412,7 +415,9 @@ class Link(BranchElement):
         setattr(model, f"p_{self.name}", self.p)
 
     def setup_constraints(self, model):
-        setattr(model, f"link_limit_{self.name}", -self.p_nom <= self.p <= self.p_nom)
+        # Split: chained comparison silently drops one half on pyoframe objs.
+        setattr(model, f"link_limit_upper_{self.name}", self.p <= self.p_nom)
+        setattr(model, f"link_limit_lower_{self.name}", self.p >= -self.p_nom)
 
     def setup_objective(self, network):
         # Link has no direct contribution to the objective function
@@ -449,10 +454,11 @@ class _StorageBase(PowerElement):
         Bus where the storage is connected
     e_nom : float
         Nominal energy capacity (MWh)
-    p_nom_in : float, default 0
-        Maximum inflow power (MW), 0 = unlimited
-    p_nom_out : float, default 0
-        Maximum outflow power (MW), 0 = unlimited
+    p_nom_in : float | None, default None
+        Maximum inflow power (MW). ``None`` = no upper bound (unlimited).
+        ``0.0`` = literally zero (no charging / no pump available).
+    p_nom_out : float | None, default None
+        Maximum outflow power (MW). Same convention as ``p_nom_in``.
     eff_in : float, default 1.0
         Inflow efficiency (0 < eff, can be >1 for abstract cases)
     eff_out : float, default 1.0
@@ -460,17 +466,11 @@ class _StorageBase(PowerElement):
     initial_soc : float, default 0.0
         Initial state of charge (MWh)
     soc_min : float, optional
-        Minimum SOC limit (None = no limit)
+        Minimum SOC limit (None = 0)
     soc_max : float, optional
         Maximum SOC limit (None = e_nom)
     influx : float, default 0.0
         Constant static influx (MW equivalent, e.g., water inflow)
-    
-    Backward compatibility:
-    - p_nom_store -> p_nom_in
-    - p_nom_dispatch -> p_nom_out
-    - eff_store -> eff_in
-    - eff_dispatch -> eff_out
     """
 
     def __init__(
@@ -479,8 +479,8 @@ class _StorageBase(PowerElement):
         network: "Network",
         bus: "Bus",
         e_nom: float,
-        p_nom_in: float = 0.0,
-        p_nom_out: float = 0.0,
+        p_nom_in: float | None = None,
+        p_nom_out: float | None = None,
         eff_in: float = 1.0,
         eff_out: float = 1.0,
         initial_soc: float = 0.0,
@@ -488,37 +488,14 @@ class _StorageBase(PowerElement):
         soc_max: float = None,
         influx: float = 0.0,
         carrier: str = "",
-        # Backward compatibility parameters
-        p_nom_store: float = None,
-        p_nom_dispatch: float = None,
-        eff_store: float = None,
-        eff_dispatch: float = None,
     ):
         super().__init__(name, network, bus)
         self.e_nom = e_nom
         self.carrier = carrier
-        
-        # Handle backward compatibility for parameter names
-        if p_nom_store is not None:
-            self.p_nom_in = p_nom_store
-        else:
-            self.p_nom_in = p_nom_in
-            
-        if p_nom_dispatch is not None:
-            self.p_nom_out = p_nom_dispatch
-        else:
-            self.p_nom_out = p_nom_out
-            
-        if eff_store is not None:
-            self.eff_in = eff_store
-        else:
-            self.eff_in = eff_in
-            
-        if eff_dispatch is not None:
-            self.eff_out = eff_dispatch
-        else:
-            self.eff_out = eff_out
-            
+        self.p_nom_in = p_nom_in
+        self.p_nom_out = p_nom_out
+        self.eff_in = eff_in
+        self.eff_out = eff_out
         self.initial_soc = initial_soc
         self.soc_min = soc_min if soc_min is not None else 0.0
         self.soc_max = soc_max if soc_max is not None else e_nom
@@ -621,17 +598,18 @@ class _StorageBase(PowerElement):
         )
         setattr(model, f"initial_soc_{self.name}", initial_soc_constraint)
 
-        # 3. Inflow power limits
-        if self.p_nom_in > 0:
-            setattr(model, f"p_in_limit_{self.name}", 0 <= self.p_in <= self.p_nom_in)
-        else:
-            setattr(model, f"p_in_limit_{self.name}", self.p_in >= 0)
+        # 3. Inflow power limits. Two separate constraints — Python's chained
+        # ``0 <= x <= n`` silently keeps only one half on pyoframe objects.
+        # Convention: ``p_nom_in = 0`` means literally 0 MW (no charging /
+        # no pump available). ``p_nom_in = None`` means unbounded above.
+        setattr(model, f"p_in_floor_{self.name}", self.p_in >= 0)
+        if self.p_nom_in is not None:
+            setattr(model, f"p_in_cap_{self.name}", self.p_in <= self.p_nom_in)
 
-        # 4. Outflow power limits
-        if self.p_nom_out > 0:
-            setattr(model, f"p_out_limit_{self.name}", 0 <= self.p_out <= self.p_nom_out)
-        else:
-            setattr(model, f"p_out_limit_{self.name}", self.p_out >= 0)
+        # 4. Outflow power limits, same convention.
+        setattr(model, f"p_out_floor_{self.name}", self.p_out >= 0)
+        if self.p_nom_out is not None:
+            setattr(model, f"p_out_cap_{self.name}", self.p_out <= self.p_nom_out)
 
         # 5. SOC bounds
         setattr(model, f"soc_min_{self.name}", self.soc >= self.soc_min)

@@ -269,10 +269,19 @@ class Network:
 
     @property
     def objective_value(self) -> float:
-        """Solved objective value, or ``None`` if not solved yet."""
+        """Solved objective value.
+
+        Returns ``None`` if the model hasn't been built. Returns ``0.0`` if
+        the model has no objective at all (no component contributed) — that
+        case is degenerate but valid (pure feasibility problem).
+        """
         if self.model is None:
             return None
-        return self.model.objective.value
+        try:
+            return self.model.objective.value
+        except ValueError:
+            # pyoframe raises ValueError when no objective is set.
+            return 0.0
 
     def __repr__(self):
         return (

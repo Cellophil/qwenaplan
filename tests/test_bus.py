@@ -46,9 +46,15 @@ class TestBusVariables:
     """Test variable creation for Bus."""
     
     def test_variables_created(self, network, snapshots):
-        """Test that Bus creates p_net and theta variables on instance."""
+        """Bus creates a theta variable on instance after set_snapshots.
+
+        There is intentionally no p_net slack variable any more — KCL is
+        closed via Generators / Loads / Storage. theta is the only Bus-owned
+        variable; KVL on AC lines couples adjacent buses through it.
+        """
         bus = network.add(pypsa.Bus, "Bus1", v_nom=1.0)
         network.set_snapshots(snapshots)
-        
-        assert hasattr(bus, "p_net")
+
         assert hasattr(bus, "theta")
+        # Sanity: confirm the slack is actually gone.
+        assert not hasattr(bus, "p_net")
