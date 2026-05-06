@@ -14,7 +14,7 @@ class DCPhysics:
         KCL: at every bus, injected power equals withdrawn + net outflow.
 
         Sign convention (collected on the LHS, balance == 0):
-          + Generator output       (p)
+          + Generator output       (var.p_t)
           - Load demand            (Load.get_p_net() returns -p_set)
           + Storage net injection  (p_out - p_in via get_p_net())
           - Outgoing line/link flow (sign depends on from_bus / to_bus)
@@ -32,18 +32,19 @@ class DCPhysics:
 
         # 1. Power elements at this bus (generators, loads, storage units, ...)
         for element in bus.network.get_connected_power_elements(bus):
-            # Storage / Load implement get_p_net(); plain Generator uses .p.
+            # Storage / Load (and composites) implement get_p_net(); plain
+            # Generator falls back to its primary variable on var.p_t.
             if hasattr(element, "get_p_net"):
                 _accum(element.get_p_net())
             else:
-                _accum(element.p)
+                _accum(element.var.p_t)
 
         # 2. Line / link flows. from_bus = outflow (subtract), to_bus = inflow (add).
         for line in bus.network.get_connected_lines(bus):
             if line.from_bus == bus:
-                _accum(-line.p)
+                _accum(-line.var.p_t)
             else:
-                _accum(line.p)
+                _accum(line.var.p_t)
 
         # If a bus has nothing attached, KCL is trivially 0 == 0; skip the
         # constraint entirely so we don't dump a degenerate row on the solver.
@@ -57,8 +58,7 @@ class DCPhysics:
         """
         KVL for DC approximation: P_flow * x_pu = theta_from - theta_to
         """
-        # This links the line flow variable to the bus angle variables
-        lhs = line.p * line.x_pu
-        rhs = line.from_bus.theta - line.to_bus.theta
+        lhs = line.var.p_t * line.x_pu
+        rhs = line.from_bus.var.theta_t - line.to_bus.var.theta_t
 
         setattr(model, f"kvl_{line.name}", lhs == rhs)

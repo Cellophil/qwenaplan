@@ -1,13 +1,24 @@
 from abc import ABC, abstractmethod
-from .base import Component, PowerElement, BranchElement, _solution_as
+from .base import (
+    Component,
+    PowerElement,
+    BranchElement,
+    _solution_as,
+    _VarContainer,
+    _SolContainer,
+)
 import polars as pl
 import pyoframe as pf
 from .physics import DCPhysics  # Import the logic
 
 
+# ---------------------------------------------------------------------------
+# Bus
+# ---------------------------------------------------------------------------
+
 class Bus(Component):
     """Bus (node) in the power grid.
-    
+
     Parameters
     ----------
     name : str
@@ -23,7 +34,7 @@ class Bus(Component):
     y : float, default 0.0
         Y coordinate for geographic visualization
     """
-    
+
     def __init__(self, name: str, network: "Network", v_nom: float = 1.0,
                  carrier: str = "AC", x: float = 0.0, y: float = 0.0):
         super().__init__(name, network)
@@ -35,15 +46,13 @@ class Bus(Component):
     def setup_variables(self):
         # Phase angle (rad) - indexed by snapshots. Required by KVL on AC lines.
         # No nodal injection variable: KCL is closed (Σ injections = Σ flows)
-        # with Loads providing demand and Generators providing supply. If the
-        # user wants a slack, they add a high-marginal-cost generator
-        # explicitly.
+        # with Loads providing demand and Generators providing supply.
         df = self.network.snapshots.to_frame()
-        self.theta = pf.Variable(df)
+        self.var.theta_t = pf.Variable(df)
 
     def setup_variables_for_model(self, model):
         # Add variables to the model so they can be used in expressions
-        setattr(model, f"theta_{self.name}", self.theta)
+        setattr(model, f"theta_{self.name}", self.var.theta_t)
 
     def setup_constraints(self, model):
         # Trigger the physics engine to build KCL for this bus
@@ -53,14 +62,13 @@ class Bus(Component):
         # Bus has no direct contribution to the objective function
         pass
 
-    @property
-    def theta_t(self) -> pl.DataFrame:
-        """Solved phase angle (rad) per snapshot."""
-        return _solution_as(self.theta, "theta")
-
     def __repr__(self) -> str:
         return f"<Bus(name={self.name}, v_nom={self.v_nom})>"
 
+
+# ---------------------------------------------------------------------------
+# ACLine
+# ---------------------------------------------------------------------------
 
 class ACLine(BranchElement):
     def __init__(
@@ -77,13 +85,12 @@ class ACLine(BranchElement):
         self.s_nom = s_nom
 
     def setup_variables(self):
-        # Explicit flow variable for numerical stability (as discussed) - indexed by snapshots
+        # Explicit flow variable for numerical stability - indexed by snapshots
         df = self.network.snapshots.to_frame()
-        self.p = pf.Variable(df)
+        self.var.p_t = pf.Variable(df)
 
     def setup_variables_for_model(self, model):
-        # Add variables to the model so they can be used in expressions
-        setattr(model, f"p_{self.name}", self.p)
+        setattr(model, f"p_{self.name}", self.var.p_t)
 
     def setup_constraints(self, model):
         # 1. Apply KVL to link this line's flow to bus angles
@@ -93,25 +100,59 @@ class ACLine(BranchElement):
         # Python's chained comparison ``a <= x <= b`` silently discards one
         # half when the operands are pyoframe objects, so we split them.
         if self.s_nom > 0:
-            setattr(model, f"line_limit_upper_{self.name}", self.p <= self.s_nom)
-            setattr(model, f"line_limit_lower_{self.name}", self.p >= -self.s_nom)
+            setattr(model, f"line_limit_upper_{self.name}", self.var.p_t <= self.s_nom)
+            setattr(model, f"line_limit_lower_{self.name}", self.var.p_t >= -self.s_nom)
 
     def setup_objective(self, network):
         # ACLine has no direct contribution to the objective function
         pass
 
-    @property
-    def p_t(self) -> pl.DataFrame:
-        """Solved line flow (MW) per snapshot. Positive = from_bus → to_bus."""
-        return _solution_as(self.p, "p")
-
     def __repr__(self) -> str:
         return f"<ACLine(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, x_pu={self.x_pu}, s_nom={self.s_nom})>"
 
 
+# ---------------------------------------------------------------------------
+# Generator
+# ---------------------------------------------------------------------------
+
+class _GeneratorVar(_VarContainer):
+    """Generator variable container with the ``p_pu_t`` view."""
+
+    @property
+    def p_pu_t(self):
+        """Capacity factor expression: ``p_t / p_nom`` (pyoframe expression).
+
+        Useful for writing constraints like ``gen.var.p_pu_t <= 0.8`` against
+        scaled limits, or for slicing the LP by carrier capacity factor.
+        """
+        gen = self._owner
+        if gen.p_nom == 0:
+            raise ZeroDivisionError(
+                f"Generator '{gen.name}' has p_nom=0; p_pu_t is undefined."
+            )
+        return self.p_t / gen.p_nom
+
+
+class _GeneratorSol(_SolContainer):
+    """Generator solution container with the ``p_pu_t`` view."""
+
+    @property
+    def p_pu_t(self) -> pl.DataFrame:
+        """Solved capacity factor: ``p / p_nom`` per snapshot."""
+        gen = self._owner
+        if gen.p_nom == 0:
+            raise ZeroDivisionError(
+                f"Generator '{gen.name}' has p_nom=0; p_pu_t is undefined."
+            )
+        df = self.p_t  # cols: <snapshot>, p
+        return df.with_columns((pl.col("p") / gen.p_nom).alias("p_pu")).select(
+            [self._owner.network.snapshots.name, "p_pu"]
+        )
+
+
 class Generator(PowerElement):
     """Power generator component.
-    
+
     Parameters
     ----------
     name : str
@@ -140,7 +181,7 @@ class Generator(PowerElement):
         Maximum ramp-down rate as per-unit of p_nom per snapshot (None = no limit).
         0.2 means the generator can decrease by at most 20% of p_nom between snapshots.
     """
-    
+
     def __init__(
         self,
         name: str,
@@ -158,7 +199,7 @@ class Generator(PowerElement):
         self.p_nom = p_nom
         self.marginal_cost = marginal_cost
         self.carrier = carrier
-        
+
         # Validate p_min_pu <= p_max_pu for static values
         if (isinstance(p_max_pu, (int, float)) and isinstance(p_min_pu, (int, float)) and
             p_max_pu is not None and p_min_pu is not None):
@@ -166,28 +207,32 @@ class Generator(PowerElement):
                 raise ValueError(
                     f"Generator '{self.name}': p_min_pu ({p_min_pu}) must be <= p_max_pu ({p_max_pu})"
                 )
-        
+
         self._p_max_pu_profile = p_max_pu if isinstance(p_max_pu, pl.Series) else None
         self._p_max_pu = p_max_pu if not isinstance(p_max_pu, pl.Series) else None
         self._p_min_pu_profile = p_min_pu if isinstance(p_min_pu, pl.Series) else None
         self._p_min_pu = p_min_pu if not isinstance(p_min_pu, pl.Series) else None
-        
+
         self.ramp_limit_up = ramp_limit_up
         self.ramp_limit_down = ramp_limit_down
 
+    def _var_container_cls(self):
+        return _GeneratorVar
+
+    def _sol_container_cls(self):
+        return _GeneratorSol
+
     def setup_variables(self):
-        # Create P_t variable - indexed by snapshots
         df = self.network.snapshots.to_frame()
-        self.p = pf.Variable(df)
+        self.var.p_t = pf.Variable(df)
 
     def setup_variables_for_model(self, model):
-        # Add variables to the model so they can be used in expressions
-        setattr(model, f"p_{self.name}", self.p)
+        setattr(model, f"p_{self.name}", self.var.p_t)
 
     def setup_constraints(self, model):
         snapshots = self.network.snapshots
         dim_name = snapshots.name
-        
+
         # 1. Build max limit (as Param for pyoframe compatibility)
         if self._p_max_pu_profile is not None:
             # Profile-based max: validate against profile min
@@ -211,7 +256,7 @@ class Generator(PowerElement):
             max_param = pf.Param(snapshots.to_frame().with_columns(
                 pl.lit(self.p_nom).alias("max")
             ))
-        
+
         # 2. Build min limit (as Param for pyoframe compatibility)
         if self._p_min_pu_profile is not None:
             # Profile-based min: validate against static max
@@ -234,30 +279,27 @@ class Generator(PowerElement):
             min_param = pf.Param(snapshots.to_frame().with_columns(
                 pl.lit(0.0).alias("min")
             ))
-        
-        # Apply min/max bounds: min_param <= p <= max_param
-        setattr(model, f"gen_limit_{self.name}", self.p <= max_param)
-        setattr(model, f"gen_lower_{self.name}", self.p >= min_param)
-        
+
+        # Apply min/max bounds
+        setattr(model, f"gen_limit_{self.name}", self.var.p_t <= max_param)
+        setattr(model, f"gen_lower_{self.name}", self.var.p_t >= min_param)
+
         # 3. Ramping constraints (if defined)
         if self.ramp_limit_up is not None or self.ramp_limit_down is not None:
             if self.ramp_limit_up is not None:
                 ramp_up_limit = self.p_nom * self.ramp_limit_up
-                # p(t) - p(t-1) <= ramp_up_limit
-                # Use .next() to shift: p.next() is p(t), p is p(t-1) (with first element dropped)
-                p_current = self.p.next(dim_name)
-                p_previous = self.p.drop_extras()
+                p_current = self.var.p_t.next(dim_name)
+                p_previous = self.var.p_t.drop_extras()
                 setattr(
                     model,
                     f"gen_ramp_up_{self.name}",
                     p_current - p_previous <= ramp_up_limit,
                 )
-            
+
             if self.ramp_limit_down is not None:
                 ramp_down_limit = self.p_nom * self.ramp_limit_down
-                # p(t-1) - p(t) <= ramp_down_limit
-                p_current = self.p.next(dim_name)
-                p_previous = self.p.drop_extras()
+                p_current = self.var.p_t.next(dim_name)
+                p_previous = self.var.p_t.drop_extras()
                 setattr(
                     model,
                     f"gen_ramp_down_{self.name}",
@@ -267,19 +309,34 @@ class Generator(PowerElement):
     def setup_objective(self, network):
         # Annualised marginal cost contribution per snapshot:
         #   p(t) * marginal_cost * duration(t) * weighting(t)
-        # Defaults of duration=1, weighting=1 reproduce the previous
-        # per-snapshot cost convention exactly.
         if self.marginal_cost != 0:
             cost_weight = network._objective_cost_weight_param()
-            network._add_to_objective(self.p * self.marginal_cost * cost_weight)
-
-    @property
-    def p_t(self) -> pl.DataFrame:
-        """Solved generator output (MW) per snapshot."""
-        return _solution_as(self.p, "p")
+            network._add_to_objective(self.var.p_t * self.marginal_cost * cost_weight)
 
     def __repr__(self) -> str:
         return f"<Generator(name={self.name}, bus={self.bus.name}, p_nom={self.p_nom}, marginal_cost={self.marginal_cost})>"
+
+
+# ---------------------------------------------------------------------------
+# Load
+# ---------------------------------------------------------------------------
+
+class _LoadSol(_SolContainer):
+    """Load solution container.
+
+    Load has no decision variables — ``p_set`` is parameter data. We expose
+    it on ``sol.p_t`` (rather than ``var.p_t``) for symmetry with other
+    components: the question "what is the load drawing per snapshot?" is a
+    *result-side* question, available pre-solve too.
+    """
+
+    @property
+    def p_t(self) -> pl.DataFrame:
+        ld = self._owner
+        snapshots = ld.network.snapshots
+        return snapshots.to_frame().with_columns(
+            ld._p_set_series.alias("p")
+        )
 
 
 class Load(PowerElement):
@@ -293,6 +350,9 @@ class Load(PowerElement):
     the same bus (e.g. ``marginal_cost=10_000``) and let the optimizer trade
     shedding cost against generation cost. This keeps the model linear and
     makes the cost of shedding explicit.
+
+    Loads have **no** ``var`` attribute (no decision variables); ``sol.p_t``
+    returns the parameter data for symmetry with Generator/etc.
 
     Parameters
     ----------
@@ -320,10 +380,16 @@ class Load(PowerElement):
         self.carrier = carrier
         self._p_set_profile = p_set if isinstance(p_set, pl.Series) else None
         self._p_set = p_set if not isinstance(p_set, pl.Series) else None
+        # Load has no var bag — drop it so attribute-typo errors are loud.
+        # (sol stays; it returns the parameter as a DataFrame.)
+        del self.var
+
+    def _sol_container_cls(self):
+        return _LoadSol
 
     def setup_variables(self):
-        # Load has no decision variable. We pre-build a Polars Series aligned
-        # to snapshots so setup_constraints / KCL can construct a Param.
+        # Load has no decision variable. Pre-build a Polars Series aligned
+        # to snapshots for KCL Param construction.
         snapshots = self.network.snapshots
         if self._p_set_profile is not None:
             self._p_set_series = self._p_set_profile
@@ -354,25 +420,18 @@ class Load(PowerElement):
         )
         return pf.Param(df)
 
-    @property
-    def p_t(self) -> pl.DataFrame:
-        """Demand (MW) per snapshot. Symmetric with Generator.p_t for tooling.
-
-        This is parameter data, available even before the model is solved.
-        """
-        snapshots = self.network.snapshots
-        return snapshots.to_frame().with_columns(
-            self._p_set_series.alias("p")
-        )
-
     def __repr__(self) -> str:
         p = self._p_set if self._p_set is not None else "<profile>"
         return f"<Load(name={self.name}, bus={self.bus.name}, p_set={p})>"
 
 
+# ---------------------------------------------------------------------------
+# Link
+# ---------------------------------------------------------------------------
+
 class Link(BranchElement):
     """Controllable flow between two buses.
-    
+
     Parameters
     ----------
     name : str
@@ -408,42 +467,123 @@ class Link(BranchElement):
 
     def setup_variables(self):
         df = self.network.snapshots.to_frame()
-        self.p = pf.Variable(df)
+        self.var.p_t = pf.Variable(df)
 
     def setup_variables_for_model(self, model):
-        # Add variables to the model so they can be used in expressions
-        setattr(model, f"p_{self.name}", self.p)
+        setattr(model, f"p_{self.name}", self.var.p_t)
 
     def setup_constraints(self, model):
         # Split: chained comparison silently drops one half on pyoframe objs.
-        setattr(model, f"link_limit_upper_{self.name}", self.p <= self.p_nom)
-        setattr(model, f"link_limit_lower_{self.name}", self.p >= -self.p_nom)
+        setattr(model, f"link_limit_upper_{self.name}", self.var.p_t <= self.p_nom)
+        setattr(model, f"link_limit_lower_{self.name}", self.var.p_t >= -self.p_nom)
 
     def setup_objective(self, network):
-        # Link has no direct contribution to the objective function
         pass
-
-    @property
-    def p_t(self) -> pl.DataFrame:
-        """Solved link flow (MW) per snapshot. Positive = from_bus → to_bus."""
-        return _solution_as(self.p, "p")
 
     def __repr__(self) -> str:
         return f"<Link(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, p_nom={self.p_nom})>"
 
 
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+def _storage_nameplate(storage) -> float:
+    """Pick the larger of ``p_nom_in`` / ``p_nom_out`` as the nameplate
+    against which a storage's net power is normalised.
+
+    Returns ``None`` if both are ``None``; callers should raise.
+    """
+    candidates = [v for v in (storage.p_nom_in, storage.p_nom_out) if v is not None]
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+class _StorageBaseVar(_VarContainer):
+    """``_StorageBase.var`` with ``soc_pu_t`` and ``p_pu_t`` views."""
+
+    @property
+    def soc_pu_t(self):
+        """SOC fill level expression: ``soc_t / e_nom``."""
+        s = self._owner
+        if s.e_nom == 0:
+            raise ZeroDivisionError(
+                f"Storage '{s.name}' has e_nom=0; soc_pu_t is undefined."
+            )
+        return self.soc_t / s.e_nom
+
+    @property
+    def p_pu_t(self):
+        """Net power expression: ``(p_out_t - p_in_t) / nameplate``.
+
+        Sign: + = discharging (injection into bus). Nameplate is the larger
+        of ``p_nom_in`` and ``p_nom_out``. Raises if both are ``None`` (no
+        capacity defined to normalise against).
+        """
+        s = self._owner
+        nameplate = _storage_nameplate(s)
+        if nameplate is None:
+            raise ValueError(
+                f"Storage '{s.name}' has neither p_nom_in nor p_nom_out set; "
+                f"p_pu_t is undefined."
+            )
+        if nameplate == 0:
+            raise ZeroDivisionError(
+                f"Storage '{s.name}' nameplate is 0; p_pu_t is undefined."
+            )
+        return (self.p_out_t - self.p_in_t) / nameplate
+
+
+class _StorageBaseSol(_SolContainer):
+    """``_StorageBase.sol`` with ``soc_pu_t`` and ``p_pu_t`` views."""
+
+    @property
+    def soc_pu_t(self) -> pl.DataFrame:
+        s = self._owner
+        if s.e_nom == 0:
+            raise ZeroDivisionError(
+                f"Storage '{s.name}' has e_nom=0; soc_pu_t is undefined."
+            )
+        df = self.soc_t  # cols: <snapshot>, soc
+        snap = s.network.snapshots.name
+        return df.with_columns((pl.col("soc") / s.e_nom).alias("soc_pu")).select(
+            [snap, "soc_pu"]
+        )
+
+    @property
+    def p_pu_t(self) -> pl.DataFrame:
+        s = self._owner
+        nameplate = _storage_nameplate(s)
+        if nameplate is None:
+            raise ValueError(
+                f"Storage '{s.name}' has neither p_nom_in nor p_nom_out set; "
+                f"p_pu_t is undefined."
+            )
+        if nameplate == 0:
+            raise ZeroDivisionError(
+                f"Storage '{s.name}' nameplate is 0; p_pu_t is undefined."
+            )
+        snap = s.network.snapshots.name
+        out = self.p_out_t  # cols: snap, p_out
+        ins = self.p_in_t   # cols: snap, p_in
+        return (
+            out.join(ins, on=snap)
+            .with_columns(((pl.col("p_out") - pl.col("p_in")) / nameplate).alias("p_pu"))
+            .select([snap, "p_pu"])
+        )
+
+
 class _StorageBase(PowerElement):
     """
     Generic base class for storage components.
-    
+
     This class defines the generic storage interface with p_in (inflow) and p_out (outflow)
     variables. It can be used directly or as a base for composite storage types.
-    
-    The SOC dynamics are defined here and reused by all storage types.
-    
+
     Follows PyPSA convention:
     soc(t) = soc(t-1) + p_in(t) * eff_in - p_out(t) / eff_out + influx(t)
-    
+
     Parameters
     ----------
     name : str
@@ -502,6 +642,12 @@ class _StorageBase(PowerElement):
         self._influx = influx
         self._influx_profile = None
 
+    def _var_container_cls(self):
+        return _StorageBaseVar
+
+    def _sol_container_cls(self):
+        return _StorageBaseSol
+
     def set_influx_profile(self, profile: pl.Series):
         """Set a time-series profile for the static influx."""
         self._influx_profile = profile
@@ -510,9 +656,9 @@ class _StorageBase(PowerElement):
     def setup_variables(self):
         """Create pyoframe variables indexed by snapshots."""
         df = self.network.snapshots.to_frame()
-        self.soc = pf.Variable(df)
-        self.p_in = pf.Variable(df)
-        self.p_out = pf.Variable(df)
+        self.var.soc_t = pf.Variable(df)
+        self.var.p_in_t = pf.Variable(df)
+        self.var.p_out_t = pf.Variable(df)
 
         # Prepare influx as time-series aligned with snapshots
         if self._influx_profile is not None:
@@ -522,9 +668,9 @@ class _StorageBase(PowerElement):
 
     def setup_variables_for_model(self, model):
         """Add variables to the model."""
-        setattr(model, f"soc_{self.name}", self.soc)
-        setattr(model, f"p_in_{self.name}", self.p_in)
-        setattr(model, f"p_out_{self.name}", self.p_out)
+        setattr(model, f"soc_{self.name}", self.var.soc_t)
+        setattr(model, f"p_in_{self.name}", self.var.p_in_t)
+        setattr(model, f"p_out_{self.name}", self.var.p_out_t)
 
     def setup_objective(self, network):
         """Storage base has no direct contribution to the objective function."""
@@ -534,31 +680,14 @@ class _StorageBase(PowerElement):
         """
         Setup SOC balance and bounds constraints.
 
-        This is the core storage logic that all storage types share. The
-        balance is in **energy units** (MWh), so each power term is multiplied
-        by the snapshot duration (hours) of the *destination* snapshot. With
-        the default duration of 1.0 the equation matches the historical
-        per-snapshot form.
-
-        ``self._influx_series`` (set in ``setup_variables``) is the source of
-        truth for influx; subclasses configure it via ``influx`` /
-        ``set_influx_profile`` rather than passing a separate Param.
+        Energy-units balance with ``Δt`` from ``network.snapshot_duration``:
+        the historical per-snapshot form falls out at ``duration=1.0``.
         """
         snapshots = self.network.snapshots
         dim_name = snapshots.name
-        # Pre-multiply influx by duration in polars so we work with a single
-        # *energy-per-snapshot* Param. This avoids needing to multiply
-        # Param×Param at pyoframe level, which is awkward across .next()/.drop_extras().
         duration_series = self.network.snapshot_duration
 
-        # 1. SOC Balance Equation (PyPSA convention; energy units)
-        #    soc(t+1) = soc(t) + p_in(t+1)*eff_in*Δt(t+1)
-        #             - p_out(t+1)/eff_out*Δt(t+1)
-        #             + influx(t+1)*Δt(t+1)
-        # Variables: .next() shifts to t+1 values.
-        # Params: pyoframe aligns by index when added; .drop_extras() projects
-        # onto the constraint dimension. We construct each per-step Param
-        # already pre-multiplied by Δt to keep the algebra linear in pyoframe.
+        # 1. SOC Balance (PyPSA convention; energy units)
         delta_t_per_in = self.eff_in * duration_series
         delta_t_per_out = duration_series / self.eff_out
         df_in = snapshots.to_frame().with_columns(delta_t_per_in.alias("k"))
@@ -575,12 +704,16 @@ class _StorageBase(PowerElement):
         )
         influx_energy_param = pf.Param(influx_energy_df)
 
+        soc = self.var.soc_t
+        p_in = self.var.p_in_t
+        p_out = self.var.p_out_t
+
         soc_balance = (
-            self.soc.next(dim_name)
+            soc.next(dim_name)
             == (
-                self.soc.drop_extras()
-                + self.p_in.next(dim_name) * eff_in_dt.drop_extras()
-                - self.p_out.next(dim_name) * eff_out_dt.drop_extras()
+                soc.drop_extras()
+                + p_in.next(dim_name) * eff_in_dt.drop_extras()
+                - p_out.next(dim_name) * eff_out_dt.drop_extras()
                 + influx_energy_param.drop_extras()
             )
         )
@@ -590,30 +723,27 @@ class _StorageBase(PowerElement):
         first_snapshot = snapshots[0]
         first_filter = pl.col(snapshots.name) == first_snapshot
         initial_soc_constraint = (
-            self.soc.filter(first_filter)
+            soc.filter(first_filter)
             == self.initial_soc
-            + self.p_in.filter(first_filter) * eff_in_dt.filter(first_filter)
-            - self.p_out.filter(first_filter) * eff_out_dt.filter(first_filter)
+            + p_in.filter(first_filter) * eff_in_dt.filter(first_filter)
+            - p_out.filter(first_filter) * eff_out_dt.filter(first_filter)
             + influx_energy_param.filter(first_filter)
         )
         setattr(model, f"initial_soc_{self.name}", initial_soc_constraint)
 
-        # 3. Inflow power limits. Two separate constraints — Python's chained
-        # ``0 <= x <= n`` silently keeps only one half on pyoframe objects.
-        # Convention: ``p_nom_in = 0`` means literally 0 MW (no charging /
-        # no pump available). ``p_nom_in = None`` means unbounded above.
-        setattr(model, f"p_in_floor_{self.name}", self.p_in >= 0)
+        # 3. Inflow power limits.
+        setattr(model, f"p_in_floor_{self.name}", p_in >= 0)
         if self.p_nom_in is not None:
-            setattr(model, f"p_in_cap_{self.name}", self.p_in <= self.p_nom_in)
+            setattr(model, f"p_in_cap_{self.name}", p_in <= self.p_nom_in)
 
-        # 4. Outflow power limits, same convention.
-        setattr(model, f"p_out_floor_{self.name}", self.p_out >= 0)
+        # 4. Outflow power limits.
+        setattr(model, f"p_out_floor_{self.name}", p_out >= 0)
         if self.p_nom_out is not None:
-            setattr(model, f"p_out_cap_{self.name}", self.p_out <= self.p_nom_out)
+            setattr(model, f"p_out_cap_{self.name}", p_out <= self.p_nom_out)
 
         # 5. SOC bounds
-        setattr(model, f"soc_min_{self.name}", self.soc >= self.soc_min)
-        setattr(model, f"soc_max_{self.name}", self.soc <= self.soc_max)
+        setattr(model, f"soc_min_{self.name}", soc >= self.soc_min)
+        setattr(model, f"soc_max_{self.name}", soc <= self.soc_max)
 
     def setup_constraints(self, model):
         """Default storage constraints. Subclasses can override if needed."""
@@ -627,33 +757,16 @@ class _StorageBase(PowerElement):
         Positive = power injected into bus
         Negative = power withdrawn from bus
         """
-        return self.p_out - self.p_in
-
-    @property
-    def soc_t(self) -> pl.DataFrame:
-        """Solved state of charge (MWh) per snapshot."""
-        return _solution_as(self.soc, "soc")
-
-    @property
-    def p_in_t(self) -> pl.DataFrame:
-        """Solved charging power (MW) per snapshot."""
-        return _solution_as(self.p_in, "p_in")
-
-    @property
-    def p_out_t(self) -> pl.DataFrame:
-        """Solved discharging power (MW) per snapshot."""
-        return _solution_as(self.p_out, "p_out")
+        return self.var.p_out_t - self.var.p_in_t
 
 
 class StorageUnit(_StorageBase):
     """
     Concrete storage unit with charge/discharge semantics.
-    
+
     This is the standard storage unit where:
     - p_in maps to p_store (charging)
     - p_out maps to p_dispatch (discharging)
-    
-    For backward compatibility and direct use cases.
     """
 
     def setup_constraints(self, model):
@@ -661,61 +774,238 @@ class StorageUnit(_StorageBase):
         self._setup_soc_constraints(model)
 
     def get_p_net(self):
-        """
-        Return net power injection for KCL.
+        return self.var.p_out_t - self.var.p_in_t
 
-        Net power = dispatch (out) - store (in)
-        Positive = power injected into bus
-        Negative = power withdrawn from bus
-        """
-        return self.p_out - self.p_in
-
-    # Backward compatibility properties
-    @property
-    def p_store(self):
-        """Alias for p_in (charging)."""
-        return self.p_in
-
-    @property
-    def p_dispatch(self):
-        """Alias for p_out (discharging)."""
-        return self.p_out
-
+    # ---- Backward-compatibility aliases (scalar parameter renames only).
+    # The plan keeps these because they're user-facing alternative names for
+    # the *same* attributes — they are not time-vectorized variables.
     @property
     def p_nom_store(self):
-        """Alias for p_nom_in."""
         return self.p_nom_in
 
     @property
     def p_nom_dispatch(self):
-        """Alias for p_nom_out."""
         return self.p_nom_out
 
     @property
     def eff_store(self):
-        """Alias for eff_in."""
         return self.eff_in
 
     @property
     def eff_dispatch(self):
-        """Alias for eff_out."""
         return self.eff_out
 
     def __repr__(self) -> str:
         return f"<StorageUnit(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom})>"
 
 
+# ---------------------------------------------------------------------------
+# Storage composites (Battery, PumpedHydroStorage)
+# ---------------------------------------------------------------------------
+
+class _BatteryVar(_VarContainer):
+    """Battery ``var`` window onto its inner ``_StorageBase``.
+
+    Exposes ``soc_t``, ``p_in_t``, ``p_out_t`` from the inner storage, plus
+    composite-level ``p_t = p_out_t - p_in_t`` and the ``p_store_t`` /
+    ``p_dispatch_t`` aliases.
+    """
+
+    def __init__(self, owner):
+        super().__init__(owner=owner)
+
+    # --- pass-throughs to inner storage variables ---
+    @property
+    def soc_t(self):
+        return self._owner._storage.var.soc_t
+
+    @property
+    def p_in_t(self):
+        return self._owner._storage.var.p_in_t
+
+    @property
+    def p_out_t(self):
+        return self._owner._storage.var.p_out_t
+
+    # --- composite-level expressions ---
+    @property
+    def p_t(self):
+        # Net electrical power (discharge - charge); pyoframe expression.
+        return self._owner._storage.var.p_out_t - self._owner._storage.var.p_in_t
+
+    @property
+    def p_store_t(self):
+        return self._owner._storage.var.p_in_t
+
+    @property
+    def p_dispatch_t(self):
+        return self._owner._storage.var.p_out_t
+
+    # --- per-unit views ---
+    @property
+    def soc_pu_t(self):
+        return self._owner._storage.var.soc_pu_t
+
+    @property
+    def p_pu_t(self):
+        b = self._owner
+        if b.p_nom == 0:
+            raise ZeroDivisionError(
+                f"Battery '{b.name}' has p_nom=0; p_pu_t is undefined."
+            )
+        return (self._owner._storage.var.p_out_t - self._owner._storage.var.p_in_t) / b.p_nom
+
+    def __repr__(self) -> str:
+        items = ["soc_t", "p_in_t", "p_out_t", "p_t", "p_store_t",
+                 "p_dispatch_t", "soc_pu_t (view)", "p_pu_t (view)"]
+        return f"<_BatteryVar({self._owner.name}): {', '.join(items)}>"
+
+
+class _BatterySol(_SolContainer):
+    """Battery ``sol`` window onto its inner storage's solved values."""
+
+    @property
+    def soc_t(self) -> pl.DataFrame:
+        return self._owner._storage.sol.soc_t
+
+    @property
+    def p_in_t(self) -> pl.DataFrame:
+        return self._owner._storage.sol.p_in_t
+
+    @property
+    def p_out_t(self) -> pl.DataFrame:
+        return self._owner._storage.sol.p_out_t
+
+    @property
+    def p_store_t(self) -> pl.DataFrame:
+        # Same value as p_in_t but with a friendlier column label.
+        return _solution_as(self._owner._storage.var.p_in_t, "p_store")
+
+    @property
+    def p_dispatch_t(self) -> pl.DataFrame:
+        return _solution_as(self._owner._storage.var.p_out_t, "p_dispatch")
+
+    @property
+    def p_t(self) -> pl.DataFrame:
+        snap = self._owner.network.snapshots.name
+        out = self.p_out_t
+        ins = self.p_in_t
+        return (
+            out.join(ins, on=snap)
+            .with_columns((pl.col("p_out") - pl.col("p_in")).alias("p"))
+            .select([snap, "p"])
+        )
+
+    @property
+    def soc_pu_t(self) -> pl.DataFrame:
+        return self._owner._storage.sol.soc_pu_t
+
+    @property
+    def p_pu_t(self) -> pl.DataFrame:
+        b = self._owner
+        if b.p_nom == 0:
+            raise ZeroDivisionError(
+                f"Battery '{b.name}' has p_nom=0; p_pu_t is undefined."
+            )
+        snap = b.network.snapshots.name
+        df = self.p_t  # cols: snap, p
+        return df.with_columns((pl.col("p") / b.p_nom).alias("p_pu")).select(
+            [snap, "p_pu"]
+        )
+
+    def __repr__(self) -> str:
+        return f"<_BatterySol({self._owner.name})>"
+
+
+class _PHSVar(_VarContainer):
+    """PumpedHydroStorage ``var`` — windows onto storage + generator inners."""
+
+    @property
+    def soc_t(self):
+        return self._owner._storage.var.soc_t
+
+    @property
+    def p_t(self):
+        # Electrical output is the generator's variable (post-coupling).
+        return self._owner._generator.var.p_t
+
+    @property
+    def p_store_t(self):
+        return self._owner._storage.var.p_in_t  # pump
+
+    @property
+    def p_dispatch_t(self):
+        return self._owner._storage.var.p_out_t  # water
+
+    # PU views: SOC delegates; net p uses turbine nameplate.
+    @property
+    def soc_pu_t(self):
+        return self._owner._storage.var.soc_pu_t
+
+    @property
+    def p_pu_t(self):
+        phs = self._owner
+        if phs.p_nom_turbine == 0:
+            raise ZeroDivisionError(
+                f"PHS '{phs.name}' has p_nom_turbine=0; p_pu_t is undefined."
+            )
+        return phs._generator.var.p_t / phs.p_nom_turbine
+
+    def __repr__(self) -> str:
+        items = ["soc_t", "p_t", "p_store_t", "p_dispatch_t",
+                 "soc_pu_t (view)", "p_pu_t (view)"]
+        return f"<_PHSVar({self._owner.name}): {', '.join(items)}>"
+
+
+class _PHSSol(_SolContainer):
+    """PHS ``sol`` — windows onto inner storage / generator solutions."""
+
+    @property
+    def soc_t(self) -> pl.DataFrame:
+        return self._owner._storage.sol.soc_t
+
+    @property
+    def p_t(self) -> pl.DataFrame:
+        return _solution_as(self._owner._generator.var.p_t, "p")
+
+    @property
+    def p_store_t(self) -> pl.DataFrame:
+        return _solution_as(self._owner._storage.var.p_in_t, "p_store")
+
+    @property
+    def p_dispatch_t(self) -> pl.DataFrame:
+        return _solution_as(self._owner._storage.var.p_out_t, "p_dispatch")
+
+    @property
+    def soc_pu_t(self) -> pl.DataFrame:
+        return self._owner._storage.sol.soc_pu_t
+
+    @property
+    def p_pu_t(self) -> pl.DataFrame:
+        phs = self._owner
+        if phs.p_nom_turbine == 0:
+            raise ZeroDivisionError(
+                f"PHS '{phs.name}' has p_nom_turbine=0; p_pu_t is undefined."
+            )
+        snap = phs.network.snapshots.name
+        df = self.p_t  # cols: snap, p
+        return df.with_columns(
+            (pl.col("p") / phs.p_nom_turbine).alias("p_pu")
+        ).select([snap, "p_pu"])
+
+    def __repr__(self) -> str:
+        return f"<_PHSSol({self._owner.name})>"
+
+
 class StorageComposite(ABC):
     """
     Abstract base class for composite storage components.
-    
+
     A composite storage holds a _StorageBase instance and optionally a Generator,
     and maps the storage's p_in/p_out to domain-specific variables.
-    
-    Subclasses define:
-    - How p_in/p_out map to their specific variables (e.g., charge/discharge, pump/turbine)
-    - Whether a generator is needed (e.g., pumped hydro has a generator, battery doesn't)
-    - Any coupling constraints between storage and generator
+
+    Subclasses install their own ``var`` / ``sol`` windows onto the inner
+    components so users see one source of truth.
     """
 
     def __init__(self, name: str, network: "Network", bus: "Bus"):
@@ -724,14 +1014,15 @@ class StorageComposite(ABC):
         self.bus = bus
         self._storage: _StorageBase = None
         self._generator: Generator = None
+        # Subclasses install var/sol after building inner components.
 
     @property
-    def storage(self) -> _StorageBase:
+    def storage(self) -> "_StorageBase":
         """Access the internal storage component."""
         return self._storage
 
     @property
-    def generator(self) -> Generator:
+    def generator(self) -> "Generator":
         """Access the internal generator component (if any)."""
         return self._generator
 
@@ -762,17 +1053,6 @@ class StorageComposite(ABC):
         self._storage.setup_objective(network)
         if self._generator:
             self._generator.setup_objective(network)
-
-    # Common property delegates
-    @property
-    def soc(self):
-        """State of charge (from storage)."""
-        return self._storage.soc
-
-    @property
-    def soc_t(self) -> pl.DataFrame:
-        """Solved state of charge (MWh) per snapshot."""
-        return self._storage.soc_t
 
 
 class PumpedHydroStorage(StorageComposite):
@@ -835,15 +1115,8 @@ class PumpedHydroStorage(StorageComposite):
         influx: float = 0.0,
     ):
         super().__init__(name, network, bus)
-
-        # gen_efficiency couples storage outflow to electrical output and is
-        # owned by this composite (not by the inner storage), so it stays a
-        # plain attribute. Everything else is delegated to the inner storage.
         self.gen_efficiency = gen_efficiency
 
-        # Build the inner storage as the single source of truth for shared
-        # parameters. User mutations on this composite (e.g. ``phs.soc_min = 5``)
-        # propagate via property setters below.
         self._storage = _StorageBase(
             name=f"{name}_storage",
             network=network,
@@ -864,6 +1137,9 @@ class PumpedHydroStorage(StorageComposite):
             bus=bus,
             p_nom=p_nom_turbine,
         )
+        # Install composite-level windows onto the inner components.
+        self.var = _PHSVar(owner=self)
+        self.sol = _PHSSol(owner=self)
 
     # Property delegates: composite reads/writes flow into the inner storage
     # / generator. Mutations remain visible at create_model() time.
@@ -916,58 +1192,19 @@ class PumpedHydroStorage(StorageComposite):
 
     def setup_constraints(self, model):
         """Setup constraints for storage and generator coupling."""
-        # Storage SOC constraints (reuses base class logic; influx already on
-        # the inner _StorageBase via __init__).
         self._storage._setup_soc_constraints(model)
-
-        # Setup generator constraints
         self._generator.setup_constraints(model)
 
         # Coupling constraint: electrical output = water dispatch * gen_efficiency
         setattr(
             model,
             f"{self.name}_coupling",
-            self._generator.p == self._storage.p_out * self.gen_efficiency,
+            self._generator.var.p_t == self._storage.var.p_out_t * self.gen_efficiency,
         )
 
     def get_p_net(self):
-        """
-        Return net power injection for KCL.
-
-        For PHS, this is the generator output (electrical power to bus).
-        """
-        return self._generator.p
-
-    # Property delegates for transparent access
-    @property
-    def p(self):
-        """Electrical power output (from generator)."""
-        return self._generator.p
-
-    @property
-    def p_store(self):
-        """Pumping power (from storage.p_in)."""
-        return self._storage.p_in
-
-    @property
-    def p_dispatch(self):
-        """Water discharge rate (from storage.p_out)."""
-        return self._storage.p_out
-
-    @property
-    def p_t(self) -> pl.DataFrame:
-        """Solved electrical output (MW) per snapshot."""
-        return _solution_as(self._generator.p, "p")
-
-    @property
-    def p_store_t(self) -> pl.DataFrame:
-        """Solved pumping power (MW) per snapshot."""
-        return _solution_as(self._storage.p_in, "p_store")
-
-    @property
-    def p_dispatch_t(self) -> pl.DataFrame:
-        """Solved water discharge (MW equiv.) per snapshot."""
-        return _solution_as(self._storage.p_out, "p_dispatch")
+        """For PHS, KCL injection is the generator's electrical output."""
+        return self._generator.var.p_t
 
     def setup_objective(self, network):
         """Delegate objective to internal generator (which may have marginal costs)."""
@@ -1029,12 +1266,6 @@ class Battery(StorageComposite):
     ):
         super().__init__(name, network, bus)
 
-        # Create the internal storage component eagerly with the supplied
-        # parameters. From here on, all of (e_nom, p_nom, eff_*, initial_soc,
-        # soc_min, soc_max) are owned by self._storage and surfaced via
-        # properties on this composite. This means user mutations like
-        # ``battery.soc_min = 20`` after construction are visible to the SOC
-        # constraint at create_model() time, where they actually matter.
         self._storage = _StorageBase(
             name=name,
             network=network,
@@ -1047,8 +1278,10 @@ class Battery(StorageComposite):
             initial_soc=initial_soc,
             soc_min=soc_min,
             soc_max=soc_max,
-            influx=0.0,  # No influx for battery
+            influx=0.0,
         )
+        self.var = _BatteryVar(owner=self)
+        self.sol = _BatterySol(owner=self)
 
     # Property delegates so attribute mutations (and reads) on the composite
     # always go through the inner storage — no risk of stale duplicate state.
@@ -1105,42 +1338,7 @@ class Battery(StorageComposite):
         Positive = power injected into bus (discharging)
         Negative = power withdrawn from bus (charging)
         """
-        return self._storage.p_out - self._storage.p_in
-
-    # Property delegates for transparent access
-    @property
-    def p(self):
-        """Net electrical power (dispatch - store)."""
-        return self._storage.p_out - self._storage.p_in
-
-    @property
-    def p_store(self):
-        """Charging power (from storage.p_in)."""
-        return self._storage.p_in
-
-    @property
-    def p_dispatch(self):
-        """Discharging power (from storage.p_out)."""
-        return self._storage.p_out
-
-    @property
-    def p_t(self) -> pl.DataFrame:
-        """Solved net power (MW): discharge − charge per snapshot."""
-        out = self._storage.p_out_t  # cols: time, p_out
-        ins = self._storage.p_in_t   # cols: time, p_in
-        return out.join(ins, on=self.network.snapshots.name).with_columns(
-            (pl.col("p_out") - pl.col("p_in")).alias("p")
-        ).select([self.network.snapshots.name, "p"])
-
-    @property
-    def p_store_t(self) -> pl.DataFrame:
-        """Solved charging power (MW) per snapshot."""
-        return _solution_as(self._storage.p_in, "p_store")
-
-    @property
-    def p_dispatch_t(self) -> pl.DataFrame:
-        """Solved discharging power (MW) per snapshot."""
-        return _solution_as(self._storage.p_out, "p_dispatch")
+        return self._storage.var.p_out_t - self._storage.var.p_in_t
 
     def __repr__(self) -> str:
         return f"<Battery(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom}, p_nom={self.p_nom})>"
