@@ -2,6 +2,26 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 
+def _solution_as(variable, column_name):
+    """Return ``variable.solution`` with the ``solution`` column renamed.
+
+    Centralises the pattern ``var.solution["solution"].to_list()`` used all
+    over the test suite. Returns the full Polars DataFrame (snapshot index +
+    value column) so users can join, filter, or aggregate as needed.
+
+    Raises a clear error if the model has not been solved yet (pyoframe
+    raises something less helpful in that case).
+    """
+    try:
+        df = variable.solution
+    except Exception as e:
+        raise RuntimeError(
+            f"Cannot read solution for {column_name!r}: model not solved "
+            f"(or pyoframe internal error: {e!s})."
+        ) from e
+    return df.rename({"solution": column_name})
+
+
 class Component(ABC):
     """Base class for all network elements."""
 

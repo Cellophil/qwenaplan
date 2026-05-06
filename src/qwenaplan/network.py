@@ -184,6 +184,30 @@ class Network:
         """
         self._objective_terms.append(expr)
 
+    # ------------------------------------------------------------------
+    # Solving
+    # ------------------------------------------------------------------
+
+    def optimize(self):
+        """Solve the model. Must be called after ``create_model()``.
+
+        Returns the pyoframe termination status. Raises if the model has not
+        been built yet so users get a clear error instead of an AttributeError.
+        """
+        if self.model is None:
+            raise RuntimeError(
+                "Model has not been built. Call create_model() before optimize()."
+            )
+        self.model.optimize()
+        return self.model.attr.TerminationStatus
+
+    @property
+    def objective_value(self) -> float:
+        """Solved objective value, or ``None`` if not solved yet."""
+        if self.model is None:
+            return None
+        return self.model.objective.value
+
     def __repr__(self):
         return (
             f"<Network(Buses={len(self.buses)}, Lines={len(self.lines)}, "

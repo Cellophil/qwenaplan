@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from .base import Component, PowerElement, BranchElement
+from .base import Component, PowerElement, BranchElement, _solution_as
 import polars as pl
 import pyoframe as pf
 from .physics import DCPhysics  # Import the logic
@@ -53,6 +53,11 @@ class Bus(Component):
         # Bus has no direct contribution to the objective function
         pass
 
+    @property
+    def theta_t(self) -> pl.DataFrame:
+        """Solved phase angle (rad) per snapshot."""
+        return _solution_as(self.theta, "theta")
+
     def __repr__(self) -> str:
         return f"<Bus(name={self.name}, v_nom={self.v_nom})>"
 
@@ -91,6 +96,11 @@ class ACLine(BranchElement):
     def setup_objective(self, network):
         # ACLine has no direct contribution to the objective function
         pass
+
+    @property
+    def p_t(self) -> pl.DataFrame:
+        """Solved line flow (MW) per snapshot. Positive = from_bus → to_bus."""
+        return _solution_as(self.p, "p")
 
     def __repr__(self) -> str:
         return f"<ACLine(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, x_pu={self.x_pu}, s_nom={self.s_nom})>"
@@ -259,6 +269,11 @@ class Generator(PowerElement):
         if self.marginal_cost != 0:
             network._add_to_objective(self.p * self.marginal_cost)
 
+    @property
+    def p_t(self) -> pl.DataFrame:
+        """Solved generator output (MW) per snapshot."""
+        return _solution_as(self.p, "p")
+
     def __repr__(self) -> str:
         return f"<Generator(name={self.name}, bus={self.bus.name}, p_nom={self.p_nom}, marginal_cost={self.marginal_cost})>"
 
@@ -335,6 +350,17 @@ class Load(PowerElement):
         )
         return pf.Param(df)
 
+    @property
+    def p_t(self) -> pl.DataFrame:
+        """Demand (MW) per snapshot. Symmetric with Generator.p_t for tooling.
+
+        This is parameter data, available even before the model is solved.
+        """
+        snapshots = self.network.snapshots
+        return snapshots.to_frame().with_columns(
+            self._p_set_series.alias("p")
+        )
+
     def __repr__(self) -> str:
         p = self._p_set if self._p_set is not None else "<profile>"
         return f"<Load(name={self.name}, bus={self.bus.name}, p_set={p})>"
@@ -390,6 +416,11 @@ class Link(BranchElement):
     def setup_objective(self, network):
         # Link has no direct contribution to the objective function
         pass
+
+    @property
+    def p_t(self) -> pl.DataFrame:
+        """Solved link flow (MW) per snapshot. Positive = from_bus → to_bus."""
+        return _solution_as(self.p, "p")
 
     def __repr__(self) -> str:
         return f"<Link(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, p_nom={self.p_nom})>"
@@ -610,6 +641,21 @@ class _StorageBase(PowerElement):
         """
         return self.p_out - self.p_in
 
+    @property
+    def soc_t(self) -> pl.DataFrame:
+        """Solved state of charge (MWh) per snapshot."""
+        return _solution_as(self.soc, "soc")
+
+    @property
+    def p_in_t(self) -> pl.DataFrame:
+        """Solved charging power (MW) per snapshot."""
+        return _solution_as(self.p_in, "p_in")
+
+    @property
+    def p_out_t(self) -> pl.DataFrame:
+        """Solved discharging power (MW) per snapshot."""
+        return _solution_as(self.p_out, "p_out")
+
 
 class StorageUnit(_StorageBase):
     """
@@ -756,6 +802,11 @@ class StorageComposite(ABC):
     def soc(self):
         """State of charge (from storage)."""
         return self._storage.soc
+
+    @property
+    def soc_t(self) -> pl.DataFrame:
+        """Solved state of charge (MWh) per snapshot."""
+        return self._storage.soc_t
 
 
 class PumpedHydroStorage(StorageComposite):
@@ -910,6 +961,21 @@ class PumpedHydroStorage(StorageComposite):
         """Water discharge rate (from storage.p_out)."""
         return self._storage.p_out
 
+    @property
+    def p_t(self) -> pl.DataFrame:
+        """Solved electrical output (MW) per snapshot."""
+        return _solution_as(self._generator.p, "p")
+
+    @property
+    def p_store_t(self) -> pl.DataFrame:
+        """Solved pumping power (MW) per snapshot."""
+        return _solution_as(self._storage.p_in, "p_store")
+
+    @property
+    def p_dispatch_t(self) -> pl.DataFrame:
+        """Solved water discharge (MW equiv.) per snapshot."""
+        return _solution_as(self._storage.p_out, "p_dispatch")
+
     def setup_objective(self, network):
         """Delegate objective to internal generator (which may have marginal costs)."""
         if self._generator:
@@ -1042,6 +1108,25 @@ class Battery(StorageComposite):
     def p_dispatch(self):
         """Discharging power (from storage.p_out)."""
         return self._storage.p_out
+
+    @property
+    def p_t(self) -> pl.DataFrame:
+        """Solved net power (MW): discharge − charge per snapshot."""
+        out = self._storage.p_out_t  # cols: time, p_out
+        ins = self._storage.p_in_t   # cols: time, p_in
+        return out.join(ins, on=self.network.snapshots.name).with_columns(
+            (pl.col("p_out") - pl.col("p_in")).alias("p")
+        ).select([self.network.snapshots.name, "p"])
+
+    @property
+    def p_store_t(self) -> pl.DataFrame:
+        """Solved charging power (MW) per snapshot."""
+        return _solution_as(self._storage.p_in, "p_store")
+
+    @property
+    def p_dispatch_t(self) -> pl.DataFrame:
+        """Solved discharging power (MW) per snapshot."""
+        return _solution_as(self._storage.p_out, "p_dispatch")
 
     def __repr__(self) -> str:
         return f"<Battery(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom}, p_nom={self.p_nom})>"
