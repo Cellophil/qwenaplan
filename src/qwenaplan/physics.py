@@ -11,31 +11,45 @@ class DCPhysics:
     @staticmethod
     def apply_kirchhoff_current_law(bus: "Bus", model: Any):
         """
-        KCL: The sum of all power injections must equal the net position
-        and the flow leaving/entering via lines and links.
-        Equation: P_net + Sum(P_gen) - Sum(P_load) = Sum(P_line_flow)
+        KCL: at every bus, injected power equals withdrawn + net outflow.
+
+        Sign convention (collected on the LHS, balance == 0):
+          + Generator output       (p)
+          - Load demand            (Load.get_p_net() returns -p_set)
+          + Storage net injection  (p_out - p_in via get_p_net())
+          - Outgoing line/link flow (sign depends on from_bus / to_bus)
+          + Incoming line/link flow
+
+        There is no nodal slack variable: if generation cannot meet load with
+        the available transmission, the LP is infeasible. To absorb shortfall,
+        add an explicit high-marginal-cost generator at the bus.
         """
-        # 1. Start with the nodal balance variable (the 'slack' or net position)
-        balance_expr = bus.p_net
+        balance_expr = None
 
-        # 2. Add all power elements connected to this bus (Generators, Loads, etc.)
-        # We assume network.get_connected_power_elements(bus) returns a list of PowerElements
+        def _accum(expr):
+            nonlocal balance_expr
+            balance_expr = expr if balance_expr is None else balance_expr + expr
+
+        # 1. Power elements at this bus (generators, loads, storage units, ...)
         for element in bus.network.get_connected_power_elements(bus):
-            # Use get_p_net() if available (for storage units), otherwise use .p
+            # Storage / Load implement get_p_net(); plain Generator uses .p.
             if hasattr(element, "get_p_net"):
-                balance_expr += element.get_p_net()
+                _accum(element.get_p_net())
             else:
-                balance_expr += element.p
+                _accum(element.p)
 
-        # 3. Subtract flows on AC Lines and Links
-        # For lines, we need to know if the bus is 'from' or 'to' to get the sign right
+        # 2. Line / link flows. from_bus = outflow (subtract), to_bus = inflow (add).
         for line in bus.network.get_connected_lines(bus):
             if line.from_bus == bus:
-                balance_expr -= line.p  # Flow leaving
+                _accum(-line.p)
             else:
-                balance_expr += line.p  # Flow entering
+                _accum(line.p)
 
-        # 4. Register the constraint in pyoframe: balance_expr == 0
+        # If a bus has nothing attached, KCL is trivially 0 == 0; skip the
+        # constraint entirely so we don't dump a degenerate row on the solver.
+        if balance_expr is None:
+            return
+
         setattr(model, f"kcl_{bus.name}", balance_expr == 0)
 
     @staticmethod

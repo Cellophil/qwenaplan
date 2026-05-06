@@ -33,21 +33,23 @@ class Bus(Component):
         self.y = y
 
     def setup_variables(self):
-        # Nodal injection (MW) and Phase Angle (rad) - indexed by snapshots
+        # Phase angle (rad) - indexed by snapshots. Required by KVL on AC lines.
+        # No nodal injection variable: KCL is closed (Σ injections = Σ flows)
+        # with Loads providing demand and Generators providing supply. If the
+        # user wants a slack, they add a high-marginal-cost generator
+        # explicitly.
         df = self.network.snapshots.to_frame()
-        self.p_net = pf.Variable(df)
         self.theta = pf.Variable(df)
 
     def setup_variables_for_model(self, model):
         # Add variables to the model so they can be used in expressions
-        setattr(model, f"p_net_{self.name}", self.p_net)
         setattr(model, f"theta_{self.name}", self.theta)
 
     def setup_constraints(self, model):
         # Trigger the physics engine to build KCL for this bus
         DCPhysics.apply_kirchhoff_current_law(self, model)
 
-    def setup_objective(self, model):
+    def setup_objective(self, network):
         # Bus has no direct contribution to the objective function
         pass
 
@@ -86,7 +88,7 @@ class ACLine(BranchElement):
         if self.s_nom > 0:
             setattr(model, f"line_limit_{self.name}", -self.s_nom <= self.p <= self.s_nom)
 
-    def setup_objective(self, model):
+    def setup_objective(self, network):
         # ACLine has no direct contribution to the objective function
         pass
 
@@ -249,14 +251,93 @@ class Generator(PowerElement):
                     p_previous - p_current <= ramp_down_limit,
                 )
 
-    def setup_objective(self, model):
-        # Add marginal cost contribution to objective: sum(p(t) * marginal_cost)
+    def setup_objective(self, network):
+        # Add marginal cost contribution: p(t) * marginal_cost, summed by Network.
+        # Snapshot duration/weighting (Tier 0 plan_05) will be applied by the
+        # Network when it sums contributions; until then this is per-snapshot
+        # cost (matching the previous implicit convention).
         if self.marginal_cost != 0:
-            objective_expr = self.p * self.marginal_cost
-            setattr(model, f"objective_{self.name}", objective_expr)
+            network._add_to_objective(self.p * self.marginal_cost)
 
     def __repr__(self) -> str:
         return f"<Generator(name={self.name}, bus={self.bus.name}, p_nom={self.p_nom}, marginal_cost={self.marginal_cost})>"
+
+
+class Load(PowerElement):
+    """Demand at a bus.
+
+    A Load is a *parameter*, not a decision variable: ``p_set`` is fixed input
+    data that withdraws power from its bus. Loads contribute ``-p_set`` to KCL.
+
+    If you want unmet-demand semantics ("load shedding"), do not use a Load
+    with optional satisfaction. Instead, add a high-marginal-cost generator at
+    the same bus (e.g. ``marginal_cost=10_000``) and let the optimizer trade
+    shedding cost against generation cost. This keeps the model linear and
+    makes the cost of shedding explicit.
+
+    Parameters
+    ----------
+    name : str
+        Unique identifier.
+    network : Network
+    bus : Bus
+        Bus where the load sits (power is withdrawn here).
+    p_set : float | pl.Series, default 0.0
+        Demand in MW. Scalar applies to every snapshot; a Polars Series must
+        be aligned with ``network.snapshots``.
+    carrier : str, default ""
+        Energy carrier (organisational metadata).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        bus: "Bus",
+        p_set: float | pl.Series = 0.0,
+        carrier: str = "",
+    ):
+        super().__init__(name, network, bus)
+        self.carrier = carrier
+        self._p_set_profile = p_set if isinstance(p_set, pl.Series) else None
+        self._p_set = p_set if not isinstance(p_set, pl.Series) else None
+
+    def setup_variables(self):
+        # Load has no decision variable. We pre-build a Polars Series aligned
+        # to snapshots so setup_constraints / KCL can construct a Param.
+        snapshots = self.network.snapshots
+        if self._p_set_profile is not None:
+            self._p_set_series = self._p_set_profile
+        else:
+            self._p_set_series = pl.Series([float(self._p_set)] * len(snapshots))
+
+    def setup_variables_for_model(self, model):
+        # Nothing to register: parameters are built lazily during KCL.
+        pass
+
+    def setup_constraints(self, model):
+        # No own constraints. KCL (in DCPhysics) consumes get_p_net().
+        pass
+
+    def setup_objective(self, network):
+        # Loads are parameters; they do not contribute to the objective.
+        pass
+
+    def get_p_net(self):
+        """Net injection from this load = ``-p_set`` (withdrawal).
+
+        Returned as a pyoframe ``Param`` so it can be added directly into the
+        KCL expression alongside Variable expressions from generators/storage.
+        """
+        snapshots = self.network.snapshots
+        df = snapshots.to_frame().with_columns(
+            (-self._p_set_series).alias("p_set_neg")
+        )
+        return pf.Param(df)
+
+    def __repr__(self) -> str:
+        p = self._p_set if self._p_set is not None else "<profile>"
+        return f"<Load(name={self.name}, bus={self.bus.name}, p_set={p})>"
 
 
 class Link(BranchElement):
@@ -306,7 +387,7 @@ class Link(BranchElement):
     def setup_constraints(self, model):
         setattr(model, f"link_limit_{self.name}", -self.p_nom <= self.p <= self.p_nom)
 
-    def setup_objective(self, model):
+    def setup_objective(self, network):
         # Link has no direct contribution to the objective function
         pass
 
@@ -436,7 +517,7 @@ class _StorageBase(PowerElement):
         setattr(model, f"p_in_{self.name}", self.p_in)
         setattr(model, f"p_out_{self.name}", self.p_out)
 
-    def setup_objective(self, model):
+    def setup_objective(self, network):
         """Storage base has no direct contribution to the objective function."""
         pass
 
@@ -664,11 +745,11 @@ class StorageComposite(ABC):
         """Return net power injection for KCL."""
         pass
 
-    def setup_objective(self, model):
+    def setup_objective(self, network):
         """Delegate objective contribution to internal components."""
-        self._storage.setup_objective(model)
+        self._storage.setup_objective(network)
         if self._generator:
-            self._generator.setup_objective(model)
+            self._generator.setup_objective(network)
 
     # Common property delegates
     @property
@@ -829,10 +910,10 @@ class PumpedHydroStorage(StorageComposite):
         """Water discharge rate (from storage.p_out)."""
         return self._storage.p_out
 
-    def setup_objective(self, model):
+    def setup_objective(self, network):
         """Delegate objective to internal generator (which may have marginal costs)."""
         if self._generator:
-            self._generator.setup_objective(model)
+            self._generator.setup_objective(network)
 
     def __repr__(self) -> str:
         return f"<PumpedHydroStorage(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom}, p_nom_turbine={self.p_nom_turbine})>"
@@ -932,9 +1013,9 @@ class Battery(StorageComposite):
         # Setup core SOC constraints from base class
         self._storage._setup_soc_constraints(model, influx_param)
 
-    def setup_objective(self, model):
+    def setup_objective(self, network):
         """Delegate objective to internal storage (battery has no direct objective contribution)."""
-        self._storage.setup_objective(model)
+        self._storage.setup_objective(network)
 
     def get_p_net(self):
         """

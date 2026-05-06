@@ -22,11 +22,15 @@ class Component(ABC):
         pass
 
     @abstractmethod
-    def setup_objective(self, model: Any):
-        """Add contribution to the objective function.
-        
-        Override in subclasses that contribute to the objective (e.g., generators with marginal costs).
-        Branch components should implement this with pass (no direct objective contribution).
+    def setup_objective(self, network: "Network"):
+        """Add contribution to the network objective.
+
+        Components that contribute (e.g. Generator with marginal_cost) should
+        call ``network._add_to_objective(expr)`` with a pyoframe expression
+        indexed by snapshots. The network sums and ``.sum()``s all
+        contributions when assembling ``model.minimize``.
+
+        Components without direct objective contribution should ``pass``.
         """
         pass
 

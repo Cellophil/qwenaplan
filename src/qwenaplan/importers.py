@@ -3,9 +3,9 @@
 This module provides the PyPSAImporter class that converts networks from the
 original PyPSA (linopy/pandas-based) to qwenaplan (pyoframe/polars-based).
 
-Supported components: Bus, Generator, ACLine, Link, StorageUnit
+Supported components: Bus, Generator, Load, ACLine, Link, StorageUnit
 Unsupported components: Transformer, Store, ShuntImpedance, Carrier (standalone),
-    GlobalConstraint, Load (handled via bus p_net)
+    GlobalConstraint
 """
 
 import logging
@@ -50,8 +50,6 @@ class PyPSAImporter:
         "Carriers",
         "GlobalConstraint",
         "GlobalConstraints",
-        "Load",
-        "Loads",
     ]
 
     # PyPSA attribute names that indicate investment/expansion features
@@ -130,16 +128,19 @@ class PyPSAImporter:
         # 3. Import generators
         self._import_generators()
 
-        # 4. Import lines
+        # 4. Import loads (must come before lines so they exist when KCL is built)
+        self._import_loads()
+
+        # 5. Import lines
         self._import_lines()
 
-        # 5. Import links
+        # 6. Import links
         self._import_links()
 
-        # 6. Import storage units
+        # 7. Import storage units
         self._import_storage_units()
 
-        # 7. Check for unsupported components
+        # 8. Check for unsupported components
         self._check_unsupported()
 
         if self.errors and self.strict_mode:
@@ -252,6 +253,45 @@ class PyPSAImporter:
                 )
             except Exception as e:
                 self.errors.append(f"Failed to import generator '{name}': {e}")
+
+    # ------------------------------------------------------------------
+    # Load import
+    # ------------------------------------------------------------------
+
+    def _import_loads(self):
+        """Import loads. PyPSA Loads have a (possibly time-varying) ``p_set``.
+
+        Time-varying ``p_set`` is supported here because Load is a parameter,
+        not a variable — it costs nothing extra in the LP. We coerce the
+        PyPSA series (pandas) to a Polars Series aligned with our snapshots.
+        """
+        loads = self._get_pypsa_components("Load")
+        if not loads:
+            loads = self._get_pypsa_components("load")
+
+        for name, attrs in loads.items():
+            try:
+                bus = self._resolve_bus(attrs, "bus")
+                if bus is None:
+                    self.errors.append(f"Load '{name}' references unknown bus")
+                    continue
+
+                p_set = self._get_attr(attrs, "p_set", 0.0)
+                # Coerce pandas/numpy time-series to a polars Series.
+                if hasattr(p_set, "to_list") and not isinstance(p_set, (int, float)):
+                    p_set = pl.Series(name=self.target.snapshots.name, values=list(p_set))
+                elif hasattr(p_set, "tolist"):
+                    p_set = pl.Series(name=self.target.snapshots.name, values=p_set.tolist())
+
+                self.target.add(
+                    "Load",
+                    name=name,
+                    bus=bus,
+                    p_set=p_set,
+                    carrier=self._get_attr(attrs, "carrier", ""),
+                )
+            except Exception as e:
+                self.errors.append(f"Failed to import load '{name}': {e}")
 
     # ------------------------------------------------------------------
     # Line import

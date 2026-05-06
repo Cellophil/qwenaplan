@@ -1,7 +1,16 @@
 import polars as pl
 import pyoframe as pf
 from typing import Dict, List, Any
-from .components import Bus, Generator, ACLine, Link, StorageUnit, PumpedHydroStorage, Battery
+from .components import (
+    Bus,
+    Generator,
+    Load,
+    ACLine,
+    Link,
+    StorageUnit,
+    PumpedHydroStorage,
+    Battery,
+)
 
 
 class Network:
@@ -10,6 +19,7 @@ class Network:
         self.lines: Dict[str, ACLine] = {}
         self.links: Dict[str, Link] = {}
         self.generators: Dict[str, Generator] = {}
+        self.loads: Dict[str, Load] = {}
         self.storage_units: Dict[str, StorageUnit] = {}
         self.pumped_hydro: Dict[str, PumpedHydroStorage] = {}
         self.batteries: Dict[str, Battery] = {}
@@ -18,33 +28,42 @@ class Network:
         self.model = None
         self._is_locked = False
 
+    # Class -> registry-dict-name. Used by both add() (class or string-name
+    # accepted) and the rest of the network for iteration.
+    _COMPONENT_REGISTRY = {
+        Bus: "buses",
+        ACLine: "lines",
+        Link: "links",
+        Generator: "generators",
+        Load: "loads",
+        StorageUnit: "storage_units",
+        PumpedHydroStorage: "pumped_hydro",
+        Battery: "batteries",
+    }
+
     def add(self, cls, name: str, **kwargs):
+        """Create a component and register it on the network.
+
+        ``cls`` may be a component class (``Generator``) or its string name
+        (``"Generator"``) — the latter mirrors PyPSA's API and is what the
+        PyPSA importer uses.
+        """
         if self._is_locked:
             raise RuntimeError("Network is locked after create_model().")
 
-        if cls == Bus:
-            obj = Bus(name, self, **kwargs)
-            self.buses[name] = obj
-        elif cls == ACLine:
-            obj = ACLine(name, self, **kwargs)
-            self.lines[name] = obj
-        elif cls == Link:
-            obj = Link(name, self, **kwargs)
-            self.links[name] = obj
-        elif cls == Generator:
-            obj = Generator(name, self, **kwargs)
-            self.generators[name] = obj
-        elif cls == StorageUnit:
-            obj = StorageUnit(name, self, **kwargs)
-            self.storage_units[name] = obj
-        elif cls == PumpedHydroStorage:
-            obj = PumpedHydroStorage(name, self, **kwargs)
-            self.pumped_hydro[name] = obj
-        elif cls == Battery:
-            obj = Battery(name, self, **kwargs)
-            self.batteries[name] = obj
-        else:
+        # Accept string class names (e.g. from the PyPSA importer).
+        if isinstance(cls, str):
+            by_name = {c.__name__: c for c in self._COMPONENT_REGISTRY}
+            if cls not in by_name:
+                raise ValueError(f"Unsupported component class name {cls!r}")
+            cls = by_name[cls]
+
+        if cls not in self._COMPONENT_REGISTRY:
             raise ValueError(f"Unsupported component class {cls}")
+
+        registry = getattr(self, self._COMPONENT_REGISTRY[cls])
+        obj = cls(name, self, **kwargs)
+        registry[name] = obj
         return obj
 
     def set_snapshots(self, snapshots: pl.Series):
@@ -59,6 +78,7 @@ class Network:
             **self.lines,
             **self.links,
             **self.generators,
+            **self.loads,
             **self.storage_units,
             **self.pumped_hydro,
             **self.batteries,
@@ -71,6 +91,8 @@ class Network:
         elements = []
         # Generators
         elements.extend([gen for gen in self.generators.values() if gen.bus == bus])
+        # Loads
+        elements.extend([ld for ld in self.loads.values() if ld.bus == bus])
         # Storage units
         elements.extend([su for su in self.storage_units.values() if su.bus == bus])
         # Pumped hydro
@@ -92,17 +114,34 @@ class Network:
                 connected.append(link)
         return connected
 
-    def create_model(self):
-        """Finalize topology and generate constraints."""
+    def create_model(self, solver: str = "highs"):
+        """Finalize topology, generate constraints, and build the objective.
+
+        Parameters
+        ----------
+        solver : str, default "highs"
+            Solver name passed to ``pyoframe.Model``. Pyoframe requires this
+            explicitly; we default to HiGHS (free, bundled via highsbox).
+
+        Notes
+        -----
+        After this call:
+        - ``self.model`` is a ``pyoframe.Model`` with all variables and constraints.
+        - ``self.model.minimize`` is the sum of every component's
+          ``setup_objective`` contribution (e.g. generator marginal costs).
+          Pyoframe forbids reassigning ``minimize``; use ``+=`` / ``-=`` to add
+          extra terms (custom constraints can still be attached freely).
+        - The network is locked: no further components may be added.
+        """
         if self.snapshots is None:
             raise RuntimeError("Must call set_snapshots() before create_model().")
 
         print("Building optimization model...")
         # 1. Initialize pyoframe model
-        self.model = pf.Model()
+        self.model = pf.Model(solver=solver)
 
         # 2. Re-trigger variable setup to add them to the model
-        all_components = {
+        all_components = list({
             **self.buses,
             **self.lines,
             **self.links,
@@ -110,7 +149,7 @@ class Network:
             **self.storage_units,
             **self.pumped_hydro,
             **self.batteries,
-        }.values()
+        }.values())
         for comp in all_components:
             comp.setup_variables_for_model(self.model)
 
@@ -118,8 +157,37 @@ class Network:
         for comp in all_components:
             comp.setup_constraints(self.model)
 
+        # 4. Assemble the objective by summing per-component contributions.
+        #    Components that contribute (e.g. Generator) call
+        #    self._add_to_objective(...) inside setup_objective; non-contributing
+        #    components do nothing. We finalize at the end.
+        self._objective_terms: List[Any] = []
+        for comp in all_components:
+            comp.setup_objective(self)
+        if self._objective_terms:
+            total = self._objective_terms[0]
+            for term in self._objective_terms[1:]:
+                total = total + term
+            self.model.minimize = total.sum()
+        # If no component contributes, leave model.minimize unset; pyoframe
+        # treats that as a feasibility problem.
+
         self._is_locked = True
         print("Model created and network locked.")
 
+    def _add_to_objective(self, expr: Any):
+        """Components call this from their ``setup_objective`` to contribute.
+
+        Receives a pyoframe expression indexed by snapshots (we ``.sum()``
+        once at the end so each contribution does not need to know about
+        snapshot weighting / duration — that lives on the network).
+        """
+        self._objective_terms.append(expr)
+
     def __repr__(self):
-        return f"<Network(Buses={len(self.buses)}, Lines={len(self.lines)}, Gens={len(self.generators)}, Storage={len(self.storage_units)}, PHS={len(self.pumped_hydro)}, Batteries={len(self.batteries)})>"
+        return (
+            f"<Network(Buses={len(self.buses)}, Lines={len(self.lines)}, "
+            f"Gens={len(self.generators)}, Loads={len(self.loads)}, "
+            f"Storage={len(self.storage_units)}, PHS={len(self.pumped_hydro)}, "
+            f"Batteries={len(self.batteries)})>"
+        )
