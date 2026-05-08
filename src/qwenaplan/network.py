@@ -286,6 +286,18 @@ class Network:
         # for the sol layer to read the snapshot dim from.
         for registry_attr, view_name in _DEFAULT_REGISTRY_VIEWS:
             members = list(getattr(self, registry_attr).values())
+            # Composites (Battery, PHS) own an internal Generator that
+            # carries their bus-facing electrical variable. Fold those
+            # into ``views["generators"]`` so a user reaching for "every
+            # electrical source in the network" gets all of them in one
+            # frame — the explicit Generators *plus* the composites'
+            # generators. Without this hook the showcase has to hand-join
+            # battery columns onto the generators view (see plan_03).
+            if view_name == "generators":
+                for bat in self.batteries.values():
+                    members.append(bat.generator)
+                for phs in self.pumped_hydro.values():
+                    members.append(phs.generator)
             self.views[view_name] = View(view_name, members, network=self)
 
         # 2. Bus views.

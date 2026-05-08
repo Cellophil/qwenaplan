@@ -87,9 +87,13 @@ class TestRegistryViewSol:
         n = small_showcase[0]
         wide = n.views["generators"].sol.p_t
         # Snapshot dim first, then one column per generator in
-        # *registry insertion order* (Coal, Solar, Peaker — that's the
-        # order they were added in the fixture).
-        assert wide.columns == ["time", "Coal", "Solar", "Peaker"]
+        # *registry insertion order* (Coal, Solar, Peaker), then
+        # composites' internal generators appended at the end (Battery
+        # and PHS — see plan_03 / Network._populate_default_views).
+        # The fixture has only a Battery, so its inverter generator
+        # ``Battery_generator`` shows up after the explicit ones.
+        assert wide.columns == ["time", "Coal", "Solar", "Peaker",
+                                "Battery_generator"]
         # Same row count as snapshots.
         assert wide.shape[0] == len(n.snapshots)
 
@@ -103,9 +107,27 @@ class TestRegistryViewSol:
         # Polars-side reduction must equal the view's server-side one.
         expected = wide.select([
             pl.col("time"),
-            pl.sum_horizontal(["Coal", "Solar", "Peaker"]).alias("p"),
+            pl.sum_horizontal(
+                ["Coal", "Solar", "Peaker", "Battery_generator"]
+            ).alias("p"),
         ])
         assert summed.equals(expected)
+
+    def test_generators_includes_composite_internal_generators(self,
+                                                               small_showcase):
+        """Battery (and PHS) inject electrical power through an internal
+        Generator. Plan_03 folds those into ``n.views["generators"]`` so
+        users get every electrical source in one frame."""
+        n, _, _, battery, _, _, _ = small_showcase
+        gens = n.views["generators"].components
+        # Explicit Generators are present.
+        names = [g.name for g in gens]
+        assert "Coal" in names
+        assert "Solar" in names
+        assert "Peaker" in names
+        # Battery's internal generator is appended.
+        assert battery.generator in gens
+        assert battery.generator.name == "Battery_generator"
 
 
 # ---------------------------------------------------------------------------
