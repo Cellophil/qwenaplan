@@ -69,6 +69,34 @@ class Bus(Component):
 # ACLine
 # ---------------------------------------------------------------------------
 
+def _check_v_nom(component, *, equal: bool) -> None:
+    """Enforce the v_nom rule for AC branch elements.
+
+    ``equal=True``  → ACLine: ``from_bus.v_nom == to_bus.v_nom``.
+    ``equal=False`` → Transformer: the two voltages must DIFFER.
+
+    The relative tolerance ``1e-6`` together with ``max(., 1.0)`` keeps the
+    default ``v_nom=1.0`` case sane without burning a special case for it.
+    """
+    v1 = component.from_bus.v_nom
+    v2 = component.to_bus.v_nom
+    rel = abs(v1 - v2) / max(v1, v2, 1.0)
+    cls_name = type(component).__name__
+    if equal and rel > 1e-6:
+        raise ValueError(
+            f"{cls_name} '{component.name}': from_bus '{component.from_bus.name}' "
+            f"(v_nom={v1}) and to_bus '{component.to_bus.name}' (v_nom={v2}) "
+            f"have different nominal voltages. Use Transformer for crossings "
+            f"between voltage levels."
+        )
+    if (not equal) and rel <= 1e-6:
+        raise ValueError(
+            f"{cls_name} '{component.name}': from_bus '{component.from_bus.name}' "
+            f"(v_nom={v1}) and to_bus '{component.to_bus.name}' (v_nom={v2}) "
+            f"have equal nominal voltages. Use ACLine for same-voltage branches."
+        )
+
+
 class ACLine(BranchElement):
     def __init__(
         self,
@@ -80,6 +108,7 @@ class ACLine(BranchElement):
         s_nom: float = 0.0,
     ):
         super().__init__(name, network, from_bus, to_bus)
+        _check_v_nom(self, equal=True)
         self.x_pu = x_pu
         self.s_nom = s_nom
 
@@ -108,6 +137,49 @@ class ACLine(BranchElement):
 
     def __repr__(self) -> str:
         return f"<ACLine(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, x_pu={self.x_pu}, s_nom={self.s_nom})>"
+
+
+# ---------------------------------------------------------------------------
+# Transformer
+# ---------------------------------------------------------------------------
+
+class Transformer(ACLine):
+    """Two-winding transformer between buses at different ``v_nom``.
+
+    Identical to :class:`ACLine` in every way (KVL via ``DCPhysics``, same
+    flow variable, thermal limit) EXCEPT the ``v_nom`` rule:
+    ``from_bus.v_nom`` MUST differ from ``to_bus.v_nom``.
+
+    ``x_pu`` is the EFFECTIVE per-unit reactance on the system MVA base
+    (1 MVA), the same convention as ACLine. PyPSA's transformer ``x`` is
+    stored in pu of the transformer's own ``s_nom`` base; conversion lives
+    in :mod:`importers` / :mod:`exporters`, **not** on this class.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        from_bus: "Bus",
+        to_bus: "Bus",
+        x_pu: float = 0.1,
+        s_nom: float = 0.0,
+    ):
+        # Bypass ACLine's equal-v_nom assertion: Transformer's rule is the
+        # opposite. Initialise the BranchElement layer (resolves the buses)
+        # then run the unequal check; finally set the same param shape as
+        # ACLine. We cannot just super().__init__() because ACLine forbids
+        # equal v_nom — and we need to forbid *un*equal.
+        BranchElement.__init__(self, name, network, from_bus, to_bus)
+        _check_v_nom(self, equal=False)
+        self.x_pu = x_pu
+        self.s_nom = s_nom
+
+    def __repr__(self) -> str:
+        return (
+            f"<Transformer(name={self.name}, {self.from_bus.name}->{self.to_bus.name}, "
+            f"x_pu={self.x_pu}, s_nom={self.s_nom})>"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +220,28 @@ class _GeneratorSol(_SolContainer):
             [self._owner.network.snapshots.name, "p_pu"]
         )
 
+    @property
+    def status_t(self) -> pl.DataFrame:
+        """Solved on/off status per snapshot.
+
+        ``status_t`` is *always present*: when ``committable=False`` it is
+        synthesised from the Param-of-1s (no decision variable), so the
+        column is uniformly available regardless of the generator's
+        committable setting. Sol-side type uniformity matters because
+        :class:`View` aggregates ``sol.status_t`` across the whole
+        ``views['generators']`` registry.
+        """
+        gen = self._owner
+        snap = gen.network.snapshots.name
+        if gen.committable:
+            return _solution_as(gen.var.status_t, "status")
+        # Param-of-1s (or, if a profile shows up later, that profile) —
+        # synthesise the same ``(snap, status)`` shape so wide-form view
+        # joins line up with the committable generators.
+        return gen.network.snapshots.to_frame().with_columns(
+            pl.lit(1.0).alias("status")
+        )
+
 
 class Generator(PowerElement):
     """Power generator component.
@@ -179,6 +273,27 @@ class Generator(PowerElement):
     ramp_limit_down : float, default None
         Maximum ramp-down rate as per-unit of p_nom per snapshot (None = no limit).
         0.2 means the generator can decrease by at most 20% of p_nom between snapshots.
+    committable : bool, default False
+        Toggle unit-commitment binary status. When ``False`` (the default),
+        ``var.status_t`` is a ``pf.Param`` of all-1.0 — the bounds reduce
+        to today's ``p_min_pu * p_nom <= p <= p_max_pu * p_nom`` and there
+        are no integer variables. When ``True``, ``var.status_t`` is a
+        snapshot-indexed binary ``pf.Variable``; the bounds become
+        ``p_min_pu * p_nom * status <= p <= p_max_pu * p_nom * status``
+        and the model becomes a MILP.
+    start_up_cost : float, default 0.0
+        Cost (€) charged per ``0 → 1`` transition of ``status_t``.
+        Only meaningful when ``committable=True``. Must be ≥ 0.
+    shut_down_cost : float, default 0.0
+        Cost (€) charged per ``1 → 0`` transition. ≥ 0.
+    cost_when_active : float, default 0.0
+        Cost (€) charged every snapshot the unit is online — i.e. every
+        snapshot where ``status_t == 1``. Maps to PyPSA's ``standby_cost``;
+        renamed because the cost applies whenever the unit is *active*
+        (online), not when it's literally standing by. Must be ≥ 0.
+        With ``committable=False``, this charges a flat constant every
+        snapshot (status is always 1) — typically you want to leave it
+        at 0 in that case.
     """
 
     def __init__(
@@ -193,6 +308,10 @@ class Generator(PowerElement):
         p_min_pu: float | pl.Series = None,
         ramp_limit_up: float = None,
         ramp_limit_down: float = None,
+        committable: bool = False,
+        start_up_cost: float = 0.0,
+        shut_down_cost: float = 0.0,
+        cost_when_active: float = 0.0,
     ):
         super().__init__(name, network, bus)
         self.p_nom = p_nom
@@ -215,6 +334,23 @@ class Generator(PowerElement):
         self.ramp_limit_up = ramp_limit_up
         self.ramp_limit_down = ramp_limit_down
 
+        # Unit commitment knobs. Negative costs would invite degenerate
+        # cycling (start up just to bank the negative startup), so reject
+        # them at construction.
+        for cost_name, cost_value in (
+            ("start_up_cost", start_up_cost),
+            ("shut_down_cost", shut_down_cost),
+            ("cost_when_active", cost_when_active),
+        ):
+            if cost_value < 0:
+                raise ValueError(
+                    f"Generator '{self.name}': {cost_name}={cost_value} must be >= 0."
+                )
+        self.committable = committable
+        self.start_up_cost = start_up_cost
+        self.shut_down_cost = shut_down_cost
+        self.cost_when_active = cost_when_active
+
     def _var_container_cls(self):
         return _GeneratorVar
 
@@ -224,9 +360,23 @@ class Generator(PowerElement):
     def setup_variables(self):
         df = self.network.snapshots.to_frame()
         self.var.p_t = pf.Variable(df)
+        # ``status_t`` is *always present* — Param-of-1s when not
+        # committable, binary Variable when committable. This makes the
+        # bounds expression ``p_t <= p_max * status_t`` uniform; views
+        # over ``sol.status_t`` aggregate without per-member branching.
+        if self.committable:
+            self.var.status_t = pf.Variable(df, vtype=pf.VType.BINARY)
+        else:
+            self.var.status_t = pf.Param(
+                df.with_columns(pl.lit(1.0).alias("status"))
+            )
 
     def setup_variables_for_model(self, model):
         setattr(model, f"p_{self.name}", self.var.p_t)
+        # Only register the binary status with the model — Params are
+        # built-up data, not solver-side decisions, so we skip them here.
+        if self.committable:
+            setattr(model, f"status_{self.name}", self.var.status_t)
 
     def setup_constraints(self, model):
         snapshots = self.network.snapshots
@@ -279,9 +429,23 @@ class Generator(PowerElement):
                 pl.lit(0.0).alias("min")
             ))
 
-        # Apply min/max bounds
-        setattr(model, f"gen_limit_{self.name}", self.var.p_t <= max_param)
-        setattr(model, f"gen_lower_{self.name}", self.var.p_t >= min_param)
+        # Apply min/max bounds, scaled by the always-present ``status_t``.
+        # ``status_t`` is a ``Param`` of 1.0 when not committable, so the
+        # constraint reduces algebraically to today's plain bounds — no
+        # ``if`` branch required, the LP shape is identical to the previous
+        # implementation in that case. When committable, the binary status
+        # zeroes both bounds simultaneously (forcing ``p_t == 0`` whenever
+        # the unit is offline).
+        setattr(
+            model,
+            f"gen_limit_{self.name}",
+            self.var.p_t <= max_param * self.var.status_t,
+        )
+        setattr(
+            model,
+            f"gen_lower_{self.name}",
+            self.var.p_t >= min_param * self.var.status_t,
+        )
 
         # 3. Ramping constraints (if defined)
         if self.ramp_limit_up is not None or self.ramp_limit_down is not None:
@@ -306,11 +470,100 @@ class Generator(PowerElement):
                 )
 
     def setup_objective(self, network):
-        # Annualised marginal cost contribution per snapshot:
-        #   p(t) * marginal_cost * duration(t) * weighting(t)
+        # Annualised cost contribution. Three sources, each gated by its own
+        # threshold so the objective stays sparse for plain LPs:
+        #
+        #   1. p(t) * marginal_cost                    — every snapshot
+        #   2. status(t) * cost_when_active            — every active snapshot
+        #   3. start_up(t)  * start_up_cost            — committable only
+        #      shut_down(t) * shut_down_cost
+        #
+        # All three multiplied by ``cost_weight = duration × weighting``.
+        cost_weight = network._objective_cost_weight_param()
+
         if self.marginal_cost != 0:
-            cost_weight = network._objective_cost_weight_param()
             network._add_to_objective(self.var.p_t * self.marginal_cost * cost_weight)
+
+        # ``cost_when_active`` (PyPSA's ``standby_cost``). With
+        # ``committable=False``, ``status_t`` is the Param-of-1s and this
+        # contributes a flat constant per snapshot — meaningful only as a
+        # convenience for round-tripping PyPSA networks; users typically
+        # leave the default 0.
+        if self.cost_when_active != 0:
+            network._add_to_objective(
+                self.var.status_t * self.cost_when_active * cost_weight
+            )
+
+        # Start-up / shut-down only pay rent on committable units. We also
+        # skip the auxiliary variables when both costs are zero (no signal
+        # to push them up against zero, but no benefit to having them
+        # either).
+        if self.committable and (self.start_up_cost != 0 or self.shut_down_cost != 0):
+            self._setup_startup_shutdown(network, cost_weight)
+
+    def _setup_startup_shutdown(self, network, cost_weight):
+        """Auxiliary variables + linking constraints for start-up / shut-down.
+
+        Auxiliaries are continuous with ``lb=0``. With ``status_t`` binary
+        and a positive cost in the objective, the LP relaxation pushes
+        them down to ``max(0, Δstatus)`` — i.e. ``{0, 1}`` — naturally.
+        Edge case at ``t=0``: assume the unit was OFF before the horizon
+        (PyPSA's default ``up_time_before=0``), so the t=0 start-up
+        equation reduces to ``start_up(0) >= status(0)``.
+        """
+        snapshots = network.snapshots
+        dim_name = snapshots.name
+        snap_frame = snapshots.to_frame()
+        first_snapshot = snapshots[0]
+        first_filter = pl.col(dim_name) == first_snapshot
+
+        self.var.start_up_t = pf.Variable(snap_frame, lb=0.0)
+        self.var.shut_down_t = pf.Variable(snap_frame, lb=0.0)
+        # Register on the model so the solver sees them.
+        setattr(network.model, f"start_up_{self.name}", self.var.start_up_t)
+        setattr(network.model, f"shut_down_{self.name}", self.var.shut_down_t)
+
+        status = self.var.status_t
+        start_up = self.var.start_up_t
+        shut_down = self.var.shut_down_t
+
+        # t > 0: start_up(t) >= status(t) - status(t-1)
+        #         shut_down(t) >= status(t-1) - status(t)
+        status_curr = status.next(dim_name)
+        status_prev = status.drop_extras()
+        setattr(
+            network.model,
+            f"start_up_link_{self.name}",
+            start_up.next(dim_name) >= status_curr - status_prev,
+        )
+        setattr(
+            network.model,
+            f"shut_down_link_{self.name}",
+            shut_down.next(dim_name) >= status_prev - status_curr,
+        )
+
+        # t = 0: previously OFF assumption ⇒ start_up(0) >= status(0),
+        # shut_down(0) >= 0 (the lb=0 already covers that, but be explicit
+        # so the constraint shows up in the model dump).
+        setattr(
+            network.model,
+            f"start_up_init_{self.name}",
+            start_up.filter(first_filter) >= status.filter(first_filter),
+        )
+        setattr(
+            network.model,
+            f"shut_down_init_{self.name}",
+            shut_down.filter(first_filter) >= 0,
+        )
+
+        if self.start_up_cost != 0:
+            network._add_to_objective(
+                self.var.start_up_t * self.start_up_cost * cost_weight
+            )
+        if self.shut_down_cost != 0:
+            network._add_to_objective(
+                self.var.shut_down_t * self.shut_down_cost * cost_weight
+            )
 
     def __repr__(self) -> str:
         return f"<Generator(name={self.name}, bus={self.bus.name}, p_nom={self.p_nom}, marginal_cost={self.marginal_cost})>"
@@ -1114,6 +1367,17 @@ class StorageComposite:
         the charge half on batteries, and on PHS would clip whenever
         ``p_nom_pump > p_nom_turbine``.
         """
+        # Defensive: the inner Generator is built with ``committable=False``
+        # in ``__init__``; a user mutating it post-hoc would silently turn
+        # the composite into a MILP with a non-sensical binary on the
+        # bus-facing variable. Catch that here, before we install any
+        # constraint that would entangle the binary with the SOC rails.
+        assert self._generator.committable is False, (
+            f"StorageComposite '{self.name}': inner Generator must not be "
+            f"committable. Set committable=False on _generator before "
+            f"create_model() — composite storage uses a continuous "
+            f"electrical variable bounded by the storage rails."
+        )
         self._storage._setup_soc_constraints(model)
 
         # Coupling: electrical p_t = p_out × η_out − p_in / η_in.

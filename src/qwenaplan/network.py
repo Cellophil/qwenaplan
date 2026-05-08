@@ -6,6 +6,7 @@ from .components import (
     Generator,
     Load,
     ACLine,
+    Transformer,
     Link,
     StorageUnit,
     PumpedHydroStorage,
@@ -25,6 +26,7 @@ _DEFAULT_REGISTRY_VIEWS: list[tuple[str, str]] = [
     ("batteries", "batteries"),
     ("pumped_hydro", "pumped_hydro"),
     ("lines", "lines"),
+    ("transformers", "transformers"),
     ("links", "links"),
 ]
 
@@ -33,6 +35,7 @@ class Network:
     def __init__(self):
         self.buses: Dict[str, Bus] = {}
         self.lines: Dict[str, ACLine] = {}
+        self.transformers: Dict[str, Transformer] = {}
         self.links: Dict[str, Link] = {}
         self.generators: Dict[str, Generator] = {}
         self.loads: Dict[str, Load] = {}
@@ -64,6 +67,7 @@ class Network:
     _COMPONENT_REGISTRY = {
         Bus: "buses",
         ACLine: "lines",
+        Transformer: "transformers",
         Link: "links",
         Generator: "generators",
         Load: "loads",
@@ -137,6 +141,7 @@ class Network:
         all_components = {
             **self.buses,
             **self.lines,
+            **self.transformers,
             **self.links,
             **self.generators,
             **self.loads,
@@ -189,12 +194,17 @@ class Network:
         return elements
 
     def get_connected_lines(self, bus: "Bus"):
-        """Returns all lines (ACLine or Link) connected to the given bus."""
+        """Returns all branches (ACLine, Transformer, or Link) connected to the bus."""
         connected = []
         # Check AC Lines
         for line in self.lines.values():
             if line.from_bus == bus or line.to_bus == bus:
                 connected.append(line)
+        # Check Transformers (Transformer ⊂ ACLine, but they live in their
+        # own registry — iterate explicitly).
+        for tx in self.transformers.values():
+            if tx.from_bus == bus or tx.to_bus == bus:
+                connected.append(tx)
         # Check Links
         for link in self.links.values():
             if link.from_bus == bus or link.to_bus == bus:
@@ -231,6 +241,7 @@ class Network:
         all_components = list({
             **self.buses,
             **self.lines,
+            **self.transformers,
             **self.links,
             **self.generators,
             **self.storage_units,
@@ -356,6 +367,7 @@ class Network:
     def __repr__(self):
         return (
             f"<Network(Buses={len(self.buses)}, Lines={len(self.lines)}, "
+            f"Transformers={len(self.transformers)}, "
             f"Gens={len(self.generators)}, Loads={len(self.loads)}, "
             f"Storage={len(self.storage_units)}, PHS={len(self.pumped_hydro)}, "
             f"Batteries={len(self.batteries)})>"

@@ -40,8 +40,6 @@ class PyPSAImporter:
 
     # Components that are permanently unsupported
     UNSUPPORTED_COMPONENTS = [
-        "Transformer",
-        "Transformers",
         "Store",
         "Stores",
         "ShuntImpedance",
@@ -69,9 +67,13 @@ class PyPSAImporter:
         "investment_periods",
     ]
 
-    # PyPSA attribute names that indicate unit commitment features
+    # PyPSA attribute names that indicate unit-commitment features still
+    # unsupported by qwenaplan. ``committable``, ``start_up_cost``,
+    # ``shut_down_cost`` and ``standby_cost`` are *now* supported (passed
+    # through in ``_import_generators`` — ``standby_cost`` becomes
+    # ``cost_when_active``); only the trickier minimum-time and
+    # piecewise-linear UC knobs remain on this list.
     UNIT_COMMITMENT_ATTRS = [
-        "committable",
         "min_up_time",
         "min_down_time",
         "up_time_before",
@@ -134,13 +136,18 @@ class PyPSAImporter:
         # 5. Import lines
         self._import_lines()
 
-        # 6. Import links
+        # 6. Import transformers (between lines and links — they are
+        # branch elements like AC lines and ought to settle into KCL
+        # before storage units' SOC rails)
+        self._import_transformers()
+
+        # 7. Import links
         self._import_links()
 
-        # 7. Import storage units
+        # 8. Import storage units
         self._import_storage_units()
 
-        # 8. Check for unsupported components
+        # 9. Check for unsupported components
         self._check_unsupported()
 
         if self.errors and self.strict_mode:
@@ -250,6 +257,15 @@ class PyPSAImporter:
                     marginal_cost=self._get_attr(attrs, "marginal_cost", 0.0),
                     carrier=self._get_attr(attrs, "carrier", ""),
                     p_max_pu=p_max_pu,
+                    # Unit-commitment passthrough. PyPSA's ``standby_cost``
+                    # is the same idea as qp's ``cost_when_active``; we
+                    # rename in the constructor (the qp name is more
+                    # transparent — the cost applies whenever the unit is
+                    # active/online, not when it's idling).
+                    committable=bool(self._get_attr(attrs, "committable", False)),
+                    start_up_cost=float(self._get_attr(attrs, "start_up_cost", 0.0)),
+                    shut_down_cost=float(self._get_attr(attrs, "shut_down_cost", 0.0)),
+                    cost_when_active=float(self._get_attr(attrs, "standby_cost", 0.0)),
                 )
             except Exception as e:
                 self.errors.append(f"Failed to import generator '{name}': {e}")
@@ -348,6 +364,89 @@ class PyPSAImporter:
                 )
             except Exception as e:
                 self.errors.append(f"Failed to import line '{name}': {e}")
+
+    # ------------------------------------------------------------------
+    # Transformer import
+    # ------------------------------------------------------------------
+
+    def _import_transformers(self):
+        """Import transformers, converting PyPSA's ``x`` (pu on the
+        transformer's own ``s_nom`` base) to qwenaplan's ``x_pu``
+        (pu on the system's 1 MVA base):
+
+            x_qp = x_pypsa / s_nom
+
+        See ``Transformer`` docstring for the rationale. ``tap_ratio != 1.0``
+        and non-zero ``phase_shift`` are out of scope here — we warn (and
+        in strict mode, error out) and skip the transformer.
+        """
+        transformers = self._get_pypsa_components("Transformer")
+        if not transformers:
+            transformers = self._get_pypsa_components("transformer")
+
+        for name, attrs in transformers.items():
+            unsupported = self._check_component_attrs(attrs, self.INVESTMENT_ATTRS)
+            if unsupported:
+                self.warnings.append(
+                    f"Transformer '{name}' has unsupported attributes: {unsupported}"
+                )
+                if self.strict_mode:
+                    self.errors.append(
+                        f"Transformer '{name}' has unsupported features in strict mode: {unsupported}"
+                    )
+                    continue
+
+            # Tap ratio / phase shift checks. Default values are 1.0 / 0.0
+            # respectively in PyPSA; anything else changes the KVL row.
+            tap_ratio = self._get_attr(attrs, "tap_ratio", 1.0)
+            phase_shift = self._get_attr(attrs, "phase_shift", 0.0)
+            if (tap_ratio is not None and tap_ratio != 1.0) or (
+                phase_shift is not None and phase_shift != 0.0
+            ):
+                msg = (
+                    f"Transformer '{name}' has tap_ratio={tap_ratio} / "
+                    f"phase_shift={phase_shift}; only the unity case is "
+                    f"supported."
+                )
+                self.warnings.append(msg)
+                if self.strict_mode:
+                    self.errors.append(msg)
+                    continue
+
+            try:
+                from_bus = self._resolve_bus(attrs, "bus0")
+                to_bus = self._resolve_bus(attrs, "bus1")
+                if from_bus is None or to_bus is None:
+                    self.errors.append(f"Transformer '{name}' references unknown bus")
+                    continue
+
+                x_pypsa = self._get_attr(attrs, "x", None)
+                if x_pypsa is None:
+                    self.warnings.append(
+                        f"Transformer '{name}' has no reactance (x), using default 0.1"
+                    )
+                    x_pypsa = 0.1
+                s_nom = self._get_attr(attrs, "s_nom", 0.0)
+                if s_nom == 0:
+                    self.errors.append(
+                        f"Transformer '{name}' has s_nom=0; cannot derive system-base x_pu."
+                    )
+                    continue
+
+                # Convert: PyPSA stores x in pu on the transformer's own
+                # MVA base; qp stores it in pu on the 1 MVA system base.
+                x_qp = x_pypsa / s_nom
+
+                self.target.add(
+                    "Transformer",
+                    name=name,
+                    from_bus=from_bus,
+                    to_bus=to_bus,
+                    x_pu=x_qp,
+                    s_nom=s_nom,
+                )
+            except Exception as e:
+                self.errors.append(f"Failed to import transformer '{name}': {e}")
 
     # ------------------------------------------------------------------
     # Link import
@@ -477,19 +576,8 @@ class PyPSAImporter:
 
     def _check_unsupported(self):
         """Check for and report unsupported components/features."""
-        # Check for transformers
-        transformers = self._get_pypsa_components("Transformer")
-        if not transformers:
-            transformers = self._get_pypsa_components("transformer")
-        if transformers:
-            self.unsupported_features["Transformers"] = list(transformers.keys())
-            self.warnings.append(
-                f"Skipping {len(transformers)} transformer(s): {list(transformers.keys())}. "
-                "Transformers are not supported in qwenaplan."
-            )
-            self.errors.append(
-                f"Network contains {len(transformers)} transformer(s) which are not supported."
-            )
+        # Transformers are now first-class and imported via
+        # ``_import_transformers``; nothing to flag here.
 
         # Check for stores
         stores = self._get_pypsa_components("Store")
