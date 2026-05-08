@@ -1,9 +1,13 @@
-"""Tests for PumpedHydroStorage (storage + coupled generator).
+"""Tests for PHS-specific behaviour.
 
-Init/repr smoke + the PHS-specific story: the inner generator's electrical
-output is locked to the inner storage's water dispatch by the coupling
-constraint ``p_gen = p_dispatch * gen_efficiency``. Generic SOC dynamics
-are covered by test_storage_unit.py.
+The shared composite shape (defaults, ``soc_min`` mutation, the inner
+``storage`` / ``generator`` existence contract) lives in
+``test_storage_composite.py`` parametrised over Battery + PHS. This
+file holds only PHS-specific things: the asymmetric ``p_nom_turbine``
+/ ``p_nom_pump`` knobs, ``gen_efficiency`` and ``influx`` semantics,
+the predictable ``_storage`` / ``_generator`` inner-component names,
+and the coupling constraint that ties electrical output to water
+dispatch.
 """
 import polars as pl
 import pyoptinterface as poi
@@ -12,30 +16,34 @@ import qwenaplan as qp
 
 
 class TestPumpedHydroInit:
-    def test_default_parameters(self):
+    def test_phs_specific_defaults(self):
+        """PHS-only knobs that don't exist on Battery: ``p_nom_turbine``,
+        ``p_nom_pump``, and the ``gen_efficiency=0.9`` default."""
         n = qp.Network()
         bus = n.add(qp.Bus, "Bus")
         phs = n.add(qp.PumpedHydroStorage, "PHS", bus=bus,
                     e_nom=1000.0, p_nom_turbine=100.0)
-        assert phs.e_nom == 1000.0
         assert phs.p_nom_turbine == 100.0
         assert phs.p_nom_pump == 0.0
         assert phs.gen_efficiency == 0.9
 
-    def test_custom_parameters(self):
+    def test_phs_specific_custom_parameters(self):
+        """PHS-only kwargs accept and round-trip: ``gen_efficiency`` and
+        ``influx``. Generic kwargs (e_nom, eff_store/dispatch, soc bounds)
+        are covered by test_storage_composite.py."""
         n = qp.Network()
         bus = n.add(qp.Bus, "Bus")
         phs = n.add(qp.PumpedHydroStorage, "PHS", bus=bus,
                     e_nom=2000.0, p_nom_turbine=150.0, p_nom_pump=100.0,
-                    eff_store=0.85, eff_dispatch=0.9, gen_efficiency=0.95,
-                    initial_soc=1000.0, soc_min=200.0, soc_max=1800.0,
-                    influx=5.0)
-        assert (phs.p_nom_pump, phs.gen_efficiency) == (100.0, 0.95)
-        assert (phs.eff_store, phs.eff_dispatch) == (0.85, 0.9)
-        assert (phs.initial_soc, phs.soc_min, phs.soc_max) == (1000.0, 200.0, 1800.0)
+                    gen_efficiency=0.95, influx=5.0)
+        assert phs.p_nom_pump == 100.0
+        assert phs.gen_efficiency == 0.95
         assert phs.influx == 5.0
 
     def test_internal_components_named_predictably(self):
+        """PHS prefixes its inner components with ``_storage`` /
+        ``_generator``. Battery uses a different naming convention (its
+        inner storage carries the battery's own name) — see test_battery."""
         n = qp.Network()
         bus = n.add(qp.Bus, "Bus")
         phs = n.add(qp.PumpedHydroStorage, "PHS", bus=bus,
@@ -46,6 +54,8 @@ class TestPumpedHydroInit:
 
 class TestPumpedHydroDelegation:
     def test_p_nom_turbine_mutation_propagates_to_inner(self):
+        """PHS-specific: mutating ``p_nom_turbine`` rewires both the inner
+        storage's outflow rail and the inner generator's nameplate."""
         n = qp.Network()
         bus = n.add(qp.Bus, "Bus")
         phs = n.add(qp.PumpedHydroStorage, "PHS", bus=bus,
@@ -53,14 +63,6 @@ class TestPumpedHydroDelegation:
         phs.p_nom_turbine = 80.0
         assert phs.storage.p_nom_out == 80.0
         assert phs.generator.p_nom == 80.0
-
-    def test_soc_min_mutation_propagates(self):
-        n = qp.Network()
-        bus = n.add(qp.Bus, "Bus")
-        phs = n.add(qp.PumpedHydroStorage, "PHS", bus=bus,
-                    e_nom=1000.0, p_nom_turbine=100.0)
-        phs.soc_min = 250.0
-        assert phs.storage.soc_min == 250.0
 
 
 class TestPumpedHydroCoupling:
