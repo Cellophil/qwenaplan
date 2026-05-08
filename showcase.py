@@ -108,12 +108,12 @@ print(f"objective = {n.objective_value:,.0f} €  ({status})")
 H = snapshots.name  # "hour"
 
 # Wide dispatch frame: one column per generator, in registry-insertion
-# order (Coal, Solar, Peaker). The battery is a separate registry
-# (`"batteries"`) so we still join its column on by hand — until the
-# planned Battery → hybrid storage+generator refactor lands and it
-# joins the generators view naturally.
-dispatch = n.views["generators"].sol.p_t.join(
-    battery.sol.p_t.rename({"p": "Battery_net"}), on=H,
+# order (Coal, Solar, Peaker). Battery composites carry an internal
+# Generator that rides into ``n.views["generators"]`` automatically
+# (see plan_03), so the battery's electrical column is already there
+# under the synthetic name ``Battery_generator`` — no hand-join.
+dispatch = n.views["generators"].sol.p_t.rename(
+    {"Battery_generator": "Battery_net"}
 )
 
 # Total load: `n.views["loads"].sol.p_t_sum` is the per-snapshot total
