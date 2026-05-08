@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 from .base import (
     Component,
     PowerElement,
@@ -810,21 +809,29 @@ class StorageUnit(_StorageBase):
 
 
 # ---------------------------------------------------------------------------
-# Storage composites (Battery, PumpedHydroStorage)
+# Storage composites (StorageComposite + Battery + PumpedHydroStorage)
 # ---------------------------------------------------------------------------
+#
+# Single concrete composite. Every composite owns:
+#   - one ``_StorageBase``        (the SOC reservoir, p_in / p_out)
+#   - one ``Generator``           (the bus-facing electrical variable)
+#   - one coupling constraint     (eq. linking inner storage and generator)
+#
+# Battery and PumpedHydroStorage are now thin subclasses that just rename a
+# couple of constructor kwargs (``p_nom`` ↔ ``p_nom_in/out`` ↔
+# ``p_nom_turbine`` / ``p_nom_pump``) and set defaults. The shared
+# var/sol windows below cover both shapes — there is no longer a
+# ``_BatteryVar/Sol`` vs ``_PHSVar/Sol`` split.
 
-class _BatteryVar(_VarContainer):
-    """Battery ``var`` window onto its inner ``_StorageBase``.
+class _StorageCompositeVar(_VarContainer):
+    """Composite ``var`` window onto its inner storage + generator.
 
-    Exposes ``soc_t``, ``p_in_t``, ``p_out_t`` from the inner storage, plus
-    composite-level ``p_t = p_out_t - p_in_t`` and the ``p_store_t`` /
-    ``p_dispatch_t`` aliases.
+    Every ``_t`` entry is a property that reads through to the inner
+    components — there are no own variables on this container. The names
+    match the public surface promised by both Battery and PHS in the
+    pre-refactor world.
     """
 
-    def __init__(self, owner):
-        super().__init__(owner=owner)
-
-    # --- pass-throughs to inner storage variables ---
     @property
     def soc_t(self):
         return self._owner._storage.var.soc_t
@@ -837,11 +844,13 @@ class _BatteryVar(_VarContainer):
     def p_out_t(self):
         return self._owner._storage.var.p_out_t
 
-    # --- composite-level expressions ---
     @property
     def p_t(self):
-        # Net electrical power (discharge - charge); pyoframe expression.
-        return self._owner._storage.var.p_out_t - self._owner._storage.var.p_in_t
+        # Net electrical injection. Now a real pyoframe variable
+        # (``generator.var.p_t``), tied to the storage by the coupling
+        # constraint ``p_t = p_out * gen_eff_out − p_in / gen_eff_in``
+        # installed in ``StorageComposite.setup_constraints``.
+        return self._owner._generator.var.p_t
 
     @property
     def p_store_t(self):
@@ -851,28 +860,29 @@ class _BatteryVar(_VarContainer):
     def p_dispatch_t(self):
         return self._owner._storage.var.p_out_t
 
-    # --- per-unit views ---
     @property
     def soc_pu_t(self):
         return self._owner._storage.var.soc_pu_t
 
     @property
     def p_pu_t(self):
-        b = self._owner
-        if b.p_nom == 0:
+        c = self._owner
+        nameplate = c._p_nom_electrical
+        if nameplate == 0:
             raise ZeroDivisionError(
-                f"Battery '{b.name}' has p_nom=0; p_pu_t is undefined."
+                f"{type(c).__name__} '{c.name}' has p_nom_electrical=0; "
+                f"p_pu_t is undefined."
             )
-        return (self._owner._storage.var.p_out_t - self._owner._storage.var.p_in_t) / b.p_nom
-
-    def __repr__(self) -> str:
-        items = ["soc_t", "p_in_t", "p_out_t", "p_t", "p_store_t",
-                 "p_dispatch_t", "soc_pu_t (view)", "p_pu_t (view)"]
-        return f"<_BatteryVar({self._owner.name}): {', '.join(items)}>"
+        return c._generator.var.p_t / nameplate
 
 
-class _BatterySol(_SolContainer):
-    """Battery ``sol`` window onto its inner storage's solved values."""
+class _StorageCompositeSol(_SolContainer):
+    """Composite ``sol`` window onto inner solved values.
+
+    ``p_t`` reads the generator's solved variable directly — no
+    hand-subtraction. The shape (snapshot col + value col) matches every
+    other component's ``sol.p_t``.
+    """
 
     @property
     def soc_t(self) -> pl.DataFrame:
@@ -885,94 +895,6 @@ class _BatterySol(_SolContainer):
     @property
     def p_out_t(self) -> pl.DataFrame:
         return self._owner._storage.sol.p_out_t
-
-    @property
-    def p_store_t(self) -> pl.DataFrame:
-        # Same value as p_in_t but with a friendlier column label.
-        return _solution_as(self._owner._storage.var.p_in_t, "p_store")
-
-    @property
-    def p_dispatch_t(self) -> pl.DataFrame:
-        return _solution_as(self._owner._storage.var.p_out_t, "p_dispatch")
-
-    @property
-    def p_t(self) -> pl.DataFrame:
-        snap = self._owner.network.snapshots.name
-        out = self.p_out_t
-        ins = self.p_in_t
-        return (
-            out.join(ins, on=snap)
-            .with_columns((pl.col("p_out") - pl.col("p_in")).alias("p"))
-            .select([snap, "p"])
-        )
-
-    @property
-    def soc_pu_t(self) -> pl.DataFrame:
-        return self._owner._storage.sol.soc_pu_t
-
-    @property
-    def p_pu_t(self) -> pl.DataFrame:
-        b = self._owner
-        if b.p_nom == 0:
-            raise ZeroDivisionError(
-                f"Battery '{b.name}' has p_nom=0; p_pu_t is undefined."
-            )
-        snap = b.network.snapshots.name
-        df = self.p_t  # cols: snap, p
-        return df.with_columns((pl.col("p") / b.p_nom).alias("p_pu")).select(
-            [snap, "p_pu"]
-        )
-
-    def __repr__(self) -> str:
-        return f"<_BatterySol({self._owner.name})>"
-
-
-class _PHSVar(_VarContainer):
-    """PumpedHydroStorage ``var`` — windows onto storage + generator inners."""
-
-    @property
-    def soc_t(self):
-        return self._owner._storage.var.soc_t
-
-    @property
-    def p_t(self):
-        # Electrical output is the generator's variable (post-coupling).
-        return self._owner._generator.var.p_t
-
-    @property
-    def p_store_t(self):
-        return self._owner._storage.var.p_in_t  # pump
-
-    @property
-    def p_dispatch_t(self):
-        return self._owner._storage.var.p_out_t  # water
-
-    # PU views: SOC delegates; net p uses turbine nameplate.
-    @property
-    def soc_pu_t(self):
-        return self._owner._storage.var.soc_pu_t
-
-    @property
-    def p_pu_t(self):
-        phs = self._owner
-        if phs.p_nom_turbine == 0:
-            raise ZeroDivisionError(
-                f"PHS '{phs.name}' has p_nom_turbine=0; p_pu_t is undefined."
-            )
-        return phs._generator.var.p_t / phs.p_nom_turbine
-
-    def __repr__(self) -> str:
-        items = ["soc_t", "p_t", "p_store_t", "p_dispatch_t",
-                 "soc_pu_t (view)", "p_pu_t (view)"]
-        return f"<_PHSVar({self._owner.name}): {', '.join(items)}>"
-
-
-class _PHSSol(_SolContainer):
-    """PHS ``sol`` — windows onto inner storage / generator solutions."""
-
-    @property
-    def soc_t(self) -> pl.DataFrame:
-        return self._owner._storage.sol.soc_t
 
     @property
     def p_t(self) -> pl.DataFrame:
@@ -992,39 +914,133 @@ class _PHSSol(_SolContainer):
 
     @property
     def p_pu_t(self) -> pl.DataFrame:
-        phs = self._owner
-        if phs.p_nom_turbine == 0:
+        c = self._owner
+        nameplate = c._p_nom_electrical
+        if nameplate == 0:
             raise ZeroDivisionError(
-                f"PHS '{phs.name}' has p_nom_turbine=0; p_pu_t is undefined."
+                f"{type(c).__name__} '{c.name}' has p_nom_electrical=0; "
+                f"p_pu_t is undefined."
             )
-        snap = phs.network.snapshots.name
+        snap = c.network.snapshots.name
         df = self.p_t  # cols: snap, p
-        return df.with_columns(
-            (pl.col("p") / phs.p_nom_turbine).alias("p_pu")
-        ).select([snap, "p_pu"])
-
-    def __repr__(self) -> str:
-        return f"<_PHSSol({self._owner.name})>"
+        return df.with_columns((pl.col("p") / nameplate).alias("p_pu")).select(
+            [snap, "p_pu"]
+        )
 
 
-class StorageComposite(ABC):
+class StorageComposite:
+    """Concrete composite of an inner ``_StorageBase`` + ``Generator``.
+
+    The user-facing ``Battery`` and ``PumpedHydroStorage`` classes are
+    thin subclasses that fix defaults and rename a couple of kwargs.
+
+    The coupling constraint installed at ``setup_constraints`` time is::
+
+        generator.var.p_t == storage.var.p_out_t * gen_efficiency
+                           - storage.var.p_in_t  / gen_efficiency_in
+
+    With ``gen_efficiency = gen_efficiency_in = 1.0`` this reduces to
+    ``p_out − p_in`` (today's Battery rule). With
+    ``gen_efficiency = 0.9, gen_efficiency_in = 1.0`` it reduces to
+    ``p_out × 0.9 − p_in`` (today's PHS rule, where the pump is treated
+    as electrical-1:1 and the pump losses are folded into ``eff_store``
+    on the storage side). Asymmetric inverter losses (modern batteries)
+    are expressed by setting both knobs.
+
+    Parameters
+    ----------
+    name : str
+        Unique identifier for the composite (used as the prefix for the
+        inner components' names by default).
+    network : Network
+    bus : Bus
+        Bus where the composite injects / withdraws.
+    e_nom : float
+        Reservoir capacity (MWh).
+    p_nom_in, p_nom_out : float | None
+        Storage-side nameplates (charging / discharging respectively).
+        See ``_StorageBase`` for the ``None`` semantics.
+    p_nom_electrical : float
+        Generator nameplate (MW). Bounds ``generator.var.p_t``.
+    eff_in, eff_out : float, default 1.0
+        Storage-side efficiencies (DC chemistry / hydraulic).
+    gen_efficiency : float, default 1.0
+        Discharge-side electrical conversion (mechanical→electrical).
+    gen_efficiency_in : float, default 1.0
+        Charge-side electrical conversion (electrical→mechanical).
+    initial_soc, soc_min, soc_max : float, optional
+        Forwarded to ``_StorageBase``.
+    influx : float, default 0.0
+        Forwarded to ``_StorageBase``.
+    storage_name, generator_name : str, optional
+        Inner-component names. Default: ``f"{name}_storage"`` and
+        ``f"{name}_generator"``. Battery overrides ``storage_name=name``
+        to preserve its pre-refactor inner naming.
+    carrier : str, default ""
+        Forwarded to the inner ``_StorageBase`` for organisational
+        metadata.
     """
-    Abstract base class for composite storage components.
 
-    A composite storage holds a _StorageBase instance and optionally a Generator,
-    and maps the storage's p_in/p_out to domain-specific variables.
-
-    Subclasses install their own ``var`` / ``sol`` windows onto the inner
-    components so users see one source of truth.
-    """
-
-    def __init__(self, name: str, network: "Network", bus: "Bus"):
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        bus: "Bus",
+        *,
+        e_nom: float,
+        p_nom_in: float | None,
+        p_nom_out: float | None,
+        p_nom_electrical: float,
+        eff_in: float = 1.0,
+        eff_out: float = 1.0,
+        gen_efficiency: float = 1.0,
+        gen_efficiency_in: float = 1.0,
+        initial_soc: float = 0.0,
+        soc_min: float = None,
+        soc_max: float = None,
+        influx: float = 0.0,
+        storage_name: str | None = None,
+        generator_name: str | None = None,
+        carrier: str = "",
+    ):
         self.name = name
         self.network = network
         self.bus = bus
-        self._storage: _StorageBase = None
-        self._generator: Generator = None
-        # Subclasses install var/sol after building inner components.
+
+        # Coupling parameters live on the composite (mutable post-construction
+        # at the user's discretion; the constraint is built at create_model
+        # time so changes before then take effect).
+        self.gen_efficiency = gen_efficiency
+        self.gen_efficiency_in = gen_efficiency_in
+        # Stored separately from the generator's p_nom because subclass
+        # property setters may rewrite both — we want a single source of
+        # truth for the per-unit normaliser.
+        self._p_nom_electrical = p_nom_electrical
+
+        self._storage = _StorageBase(
+            name=storage_name if storage_name is not None else f"{name}_storage",
+            network=network,
+            bus=bus,
+            e_nom=e_nom,
+            p_nom_in=p_nom_in,
+            p_nom_out=p_nom_out,
+            eff_in=eff_in,
+            eff_out=eff_out,
+            initial_soc=initial_soc,
+            soc_min=soc_min,
+            soc_max=soc_max,
+            influx=influx,
+            carrier=carrier,
+        )
+        self._generator = Generator(
+            name=generator_name if generator_name is not None else f"{name}_generator",
+            network=network,
+            bus=bus,
+            p_nom=p_nom_electrical,
+            carrier=carrier,
+        )
+        self.var = _StorageCompositeVar(owner=self)
+        self.sol = _StorageCompositeSol(owner=self)
 
     @property
     def storage(self) -> "_StorageBase":
@@ -1033,165 +1049,18 @@ class StorageComposite(ABC):
 
     @property
     def generator(self) -> "Generator":
-        """Access the internal generator component (if any)."""
+        """Access the internal generator component."""
         return self._generator
 
-    def setup_variables(self):
-        """Setup variables for all internal components."""
-        self._storage.setup_variables()
-        if self._generator:
-            self._generator.setup_variables()
+    # ---- shared property delegates --------------------------------------
+    # The kwargs that map 1:1 to the inner storage live here so subclasses
+    # don't repeat themselves. Subclasses add their own renamed kwargs
+    # (``p_nom`` for Battery, ``p_nom_turbine`` / ``p_nom_pump`` for PHS).
 
-    def setup_variables_for_model(self, model):
-        """Add variables to the model."""
-        self._storage.setup_variables_for_model(model)
-        if self._generator:
-            self._generator.setup_variables_for_model(model)
-
-    @abstractmethod
-    def setup_constraints(self, model):
-        """Setup constraints - must be implemented by subclasses."""
-        pass
-
-    @abstractmethod
-    def get_p_net(self):
-        """Return net power injection for KCL."""
-        pass
-
-    def setup_objective(self, network):
-        """Delegate objective contribution to internal components."""
-        self._storage.setup_objective(network)
-        if self._generator:
-            self._generator.setup_objective(network)
-
-    # Mirror :meth:`Component.injection_at` / :meth:`Component.injection_sign_at`
-    # so KCL and the views layer can call them uniformly across power
-    # elements, branches, and composites. ``StorageComposite`` doesn't
-    # inherit from :class:`Component` (yet — see the deferred Battery /
-    # PHS unification plan), so we duplicate the small default here. The
-    # two methods together are the single contract the rest of the code
-    # talks to: ``injection_at(bus)`` for the symbolic side,
-    # ``injection_sign_at(bus)`` for the numeric side.
-    def injection_sign_at(self, bus) -> int:
-        return +1
-
-    def sol_sign_at(self, bus) -> int:
-        # ``sol.p_t`` on Battery / PHS is already the signed net (Battery:
-        # ``p_dispatch − p_store``; PHS: the generator's electrical
-        # output, positive = injection). Same sign as a generator at
-        # this bus.
-        return +1
-
-    def injection_at(self, bus):
-        sign = self.injection_sign_at(bus)
-        base = self.get_p_net()
-        return base if sign == 1 else sign * base
-
-
-class PumpedHydroStorage(StorageComposite):
-    """
-    Composite class for pumped hydro storage.
-
-    Combines a _StorageBase (reservoir/SOC) with a Generator (turbine output).
-    The storage p_out represents water flow through the turbine,
-    and the generator output is the electrical power produced.
-
-    Variable mapping:
-    - storage.p_in -> pump (pumping water back to reservoir)
-    - storage.p_out -> dispatch (water flowing through turbine)
-    - generator.p -> electrical output (dispatch * gen_efficiency)
-
-    Parameters
-    ----------
-    name : str
-        Unique identifier for the pumped hydro storage
-    network : Network
-        Reference to the parent network
-    bus : Bus
-        Bus where the storage is connected
-    e_nom : float
-        Nominal energy capacity of reservoir (MWh equivalent)
-    p_nom_turbine : float
-        Maximum turbine power (MW) - limits both dispatch and generator
-    p_nom_pump : float, default 0
-        Maximum pumping power (MW), 0 = unlimited
-    eff_store : float, default 1.0
-        Pumping efficiency
-    eff_dispatch : float, default 1.0
-        Hydraulic efficiency (water to mechanical)
-    gen_efficiency : float, default 0.9
-        Generator efficiency (mechanical to electrical)
-    initial_soc : float, default 0.0
-        Initial state of charge
-    soc_min : float, optional
-        Minimum SOC limit
-    soc_max : float, optional
-        Maximum SOC limit (defaults to e_nom)
-    influx : float, default 0.0
-        Constant static influx (water inflow)
-    """
-
-    def __init__(
-        self,
-        name: str,
-        network: "Network",
-        bus: "Bus",
-        e_nom: float,
-        p_nom_turbine: float,
-        p_nom_pump: float = 0.0,
-        eff_store: float = 1.0,
-        eff_dispatch: float = 1.0,
-        gen_efficiency: float = 0.9,
-        initial_soc: float = 0.0,
-        soc_min: float = None,
-        soc_max: float = None,
-        influx: float = 0.0,
-    ):
-        super().__init__(name, network, bus)
-        self.gen_efficiency = gen_efficiency
-
-        self._storage = _StorageBase(
-            name=f"{name}_storage",
-            network=network,
-            bus=bus,
-            e_nom=e_nom,
-            p_nom_in=p_nom_pump,        # p_in = pump
-            p_nom_out=p_nom_turbine,    # p_out = water dispatch
-            eff_in=eff_store,
-            eff_out=eff_dispatch,
-            initial_soc=initial_soc,
-            soc_min=soc_min,
-            soc_max=soc_max,
-            influx=influx,
-        )
-        self._generator = Generator(
-            name=f"{name}_generator",
-            network=network,
-            bus=bus,
-            p_nom=p_nom_turbine,
-        )
-        # Install composite-level windows onto the inner components.
-        self.var = _PHSVar(owner=self)
-        self.sol = _PHSSol(owner=self)
-
-    # Property delegates: composite reads/writes flow into the inner storage
-    # / generator. Mutations remain visible at create_model() time.
     @property
     def e_nom(self): return self._storage.e_nom
     @e_nom.setter
     def e_nom(self, v): self._storage.e_nom = v
-
-    @property
-    def p_nom_pump(self): return self._storage.p_nom_in
-    @p_nom_pump.setter
-    def p_nom_pump(self, v): self._storage.p_nom_in = v
-
-    @property
-    def p_nom_turbine(self): return self._storage.p_nom_out
-    @p_nom_turbine.setter
-    def p_nom_turbine(self, v):
-        self._storage.p_nom_out = v
-        self._generator.p_nom = v
 
     @property
     def eff_store(self): return self._storage.eff_in
@@ -1223,65 +1092,105 @@ class PumpedHydroStorage(StorageComposite):
     @influx.setter
     def influx(self, v): self._storage._influx = v
 
+    # ---- lifecycle hooks (mirror Component's contract) ------------------
+
+    def setup_variables(self):
+        self._storage.setup_variables()
+        self._generator.setup_variables()
+
+    def setup_variables_for_model(self, model):
+        self._storage.setup_variables_for_model(model)
+        self._generator.setup_variables_for_model(model)
+
     def setup_constraints(self, model):
-        """Setup constraints for storage and generator coupling."""
+        """Install storage SOC and the coupling row.
+
+        We deliberately do **not** call ``self._generator.setup_constraints``:
+        :class:`Generator` would install ``0 <= p_t <= p_nom``, but for a
+        composite storage the electrical variable must be free to swing
+        negative on charging. The feasible band is fully determined by
+        the storage's ``p_in`` / ``p_out`` bounds plus the coupling
+        equality below — adding the generator's own bounds would clip
+        the charge half on batteries, and on PHS would clip whenever
+        ``p_nom_pump > p_nom_turbine``.
+        """
         self._storage._setup_soc_constraints(model)
-        self._generator.setup_constraints(model)
 
-        # Coupling constraint: electrical output = water dispatch * gen_efficiency
-        setattr(
-            model,
-            f"{self.name}_coupling",
-            self._generator.var.p_t == self._storage.var.p_out_t * self.gen_efficiency,
+        # Coupling: electrical p_t = p_out × η_out − p_in / η_in.
+        # ``η_out = η_in = 1`` collapses to ``p_out − p_in`` (Battery
+        # rule). ``η_out = 0.9, η_in = 1`` collapses to
+        # ``p_out × 0.9 − p_in`` (today's PHS rule).
+        coupling = (
+            self._generator.var.p_t
+            == self._storage.var.p_out_t * self.gen_efficiency
+            - self._storage.var.p_in_t / self.gen_efficiency_in
         )
-
-    def get_p_net(self):
-        """For PHS, KCL injection is the generator's electrical output."""
-        return self._generator.var.p_t
+        setattr(model, f"{self.name}_coupling", coupling)
 
     def setup_objective(self, network):
-        """Delegate objective to internal generator (which may have marginal costs)."""
-        if self._generator:
-            self._generator.setup_objective(network)
+        """Delegate to inner components (Generator may carry a marginal cost)."""
+        self._storage.setup_objective(network)
+        self._generator.setup_objective(network)
+
+    def get_p_net(self):
+        """KCL injection: the generator's electrical variable.
+
+        The coupling constraint guarantees this equals the bus-side
+        electrical net (charge minus discharge, both signed by their
+        inverter / generator efficiencies).
+        """
+        return self._generator.var.p_t
+
+    # ---- bus-injection abstraction --------------------------------------
+    # Mirrors :meth:`Component.injection_at` / :meth:`Component.injection_sign_at`
+    # so KCL and the views layer can call them uniformly across power
+    # elements, branches, and composites. Composite isn't a Component
+    # subclass (it owns two of them), so we duplicate the small default.
+
+    def injection_sign_at(self, bus) -> int:
+        return +1
+
+    def sol_sign_at(self, bus) -> int:
+        # ``sol.p_t`` is the generator's solved value — already in
+        # injection convention (+ = bus injection).
+        return +1
+
+    def injection_at(self, bus):
+        sign = self.injection_sign_at(bus)
+        base = self.get_p_net()
+        return base if sign == 1 else sign * base
 
     def __repr__(self) -> str:
-        return f"<PumpedHydroStorage(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom}, p_nom_turbine={self.p_nom_turbine})>"
+        return (
+            f"<{type(self).__name__}(name={self.name}, bus={self.bus.name}, "
+            f"e_nom={self.e_nom}, p_nom_electrical={self._p_nom_electrical})>"
+        )
 
 
 class Battery(StorageComposite):
-    """
-    Composite class for battery storage.
+    """Battery — composite storage with symmetric AC charge/discharge.
 
-    A battery is a storage unit with direct electrical coupling (no separate generator).
-    Net power = dispatch - store (positive = discharging to bus).
-
-    Variable mapping:
-    - storage.p_in -> charge (charging the battery)
-    - storage.p_out -> discharge (discharging from battery)
-    - p (net) -> discharge - charge (electrical power to/from bus)
+    A battery has a single inverter doing both AC→DC (charging) and
+    DC→AC (discharging). The default ``gen_efficiency = gen_efficiency_in
+    = 1.0`` reproduces the pre-refactor rule ``p_t = p_out − p_in``;
+    users with measured asymmetric inverter losses can set both knobs.
 
     Parameters
     ----------
-    name : str
-        Unique identifier for the battery
-    network : Network
-        Reference to the parent network
-    bus : Bus
-        Bus where the battery is connected
+    name, network, bus
+        See :class:`StorageComposite`.
     e_nom : float
-        Nominal energy capacity (MWh)
+        Energy capacity (MWh).
     p_nom : float
-        Maximum power (MW) for both charge and discharge
-    eff_store : float, default 1.0
-        Charging efficiency
-    eff_dispatch : float, default 1.0
-        Discharging efficiency
-    initial_soc : float, default 0.0
-        Initial state of charge
-    soc_min : float, optional
-        Minimum SOC limit
-    soc_max : float, optional
-        Maximum SOC limit (defaults to e_nom)
+        Maximum power (MW), applied to charge, discharge, and the inverter.
+    eff_store, eff_dispatch : float, default 1.0
+        DC-side charging / discharging efficiencies.
+    gen_efficiency, gen_efficiency_in : float, default 1.0
+        Inverter electrical efficiencies (discharge / charge sides).
+    initial_soc, soc_min, soc_max : float, optional
+        SOC parameters.
+    influx : float, default 0.0
+        External energy inflow (rarely used for a battery; default 0).
     """
 
     def __init__(
@@ -1289,89 +1198,123 @@ class Battery(StorageComposite):
         name: str,
         network: "Network",
         bus: "Bus",
+        *,
         e_nom: float,
         p_nom: float,
         eff_store: float = 1.0,
         eff_dispatch: float = 1.0,
+        gen_efficiency: float = 1.0,
+        gen_efficiency_in: float = 1.0,
         initial_soc: float = 0.0,
         soc_min: float = None,
         soc_max: float = None,
+        influx: float = 0.0,
     ):
-        super().__init__(name, network, bus)
-
-        self._storage = _StorageBase(
-            name=name,
-            network=network,
-            bus=bus,
+        super().__init__(
+            name, network, bus,
             e_nom=e_nom,
-            p_nom_in=p_nom,   # p_in = charge
-            p_nom_out=p_nom,  # p_out = discharge
-            eff_in=eff_store,
-            eff_out=eff_dispatch,
-            initial_soc=initial_soc,
-            soc_min=soc_min,
-            soc_max=soc_max,
-            influx=0.0,
+            p_nom_in=p_nom, p_nom_out=p_nom,
+            p_nom_electrical=p_nom,
+            eff_in=eff_store, eff_out=eff_dispatch,
+            gen_efficiency=gen_efficiency,
+            gen_efficiency_in=gen_efficiency_in,
+            initial_soc=initial_soc, soc_min=soc_min, soc_max=soc_max,
+            influx=influx,
+            # Preserve the pre-refactor inner-storage name (just ``name``)
+            # so any external code reaching for ``model.soc_<name>`` keeps
+            # working.
+            storage_name=name,
         )
-        self.var = _BatteryVar(owner=self)
-        self.sol = _BatterySol(owner=self)
 
-    # Property delegates so attribute mutations (and reads) on the composite
-    # always go through the inner storage — no risk of stale duplicate state.
+    # Single ``p_nom`` knob spans both inner storage rails and the inverter.
     @property
-    def e_nom(self): return self._storage.e_nom
-    @e_nom.setter
-    def e_nom(self, v): self._storage.e_nom = v
-
-    @property
-    def p_nom(self): return self._storage.p_nom_in  # in == out for battery
+    def p_nom(self): return self._storage.p_nom_in   # in == out for battery
     @p_nom.setter
     def p_nom(self, v):
         self._storage.p_nom_in = v
         self._storage.p_nom_out = v
+        self._generator.p_nom = v
+        self._p_nom_electrical = v
+
+
+class PumpedHydroStorage(StorageComposite):
+    """Pumped-hydro plant — reservoir + turbine generator + (optional) pump.
+
+    The default ``gen_efficiency = 0.9, gen_efficiency_in = 1.0``
+    reproduces the pre-refactor PHS rule ``p_t = p_out × 0.9 − p_in``,
+    where the pump is treated as electrically 1:1 and pump losses are
+    folded into ``eff_store`` on the storage side.
+
+    Variable mapping
+    ----------------
+    - ``storage.p_in``  → pumping (water back into the reservoir)
+    - ``storage.p_out`` → water flow through the turbine
+    - ``generator.p``   → electrical bus injection
+
+    Parameters
+    ----------
+    name, network, bus
+        See :class:`StorageComposite`.
+    e_nom : float
+        Reservoir capacity (MWh equivalent).
+    p_nom_turbine : float
+        Maximum turbine power (MW). Bounds both the water dispatch and
+        the generator's electrical output.
+    p_nom_pump : float, default 0.0
+        Maximum pumping power (MW); 0.0 means no pumping rail.
+    eff_store, eff_dispatch : float, default 1.0
+        Pump and hydraulic efficiencies.
+    gen_efficiency : float, default 0.9
+        Mechanical→electrical (generator) efficiency.
+    gen_efficiency_in : float, default 1.0
+        Electrical→mechanical (pump motor) efficiency. The historical
+        PHS rule ignored this term, hence the default of 1.0; set to
+        less than 1 to model pump-motor electrical loss explicitly.
+    initial_soc, soc_min, soc_max : float, optional
+        SOC parameters.
+    influx : float, default 0.0
+        Constant water inflow to the reservoir (MW equivalent).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        network: "Network",
+        bus: "Bus",
+        *,
+        e_nom: float,
+        p_nom_turbine: float,
+        p_nom_pump: float = 0.0,
+        eff_store: float = 1.0,
+        eff_dispatch: float = 1.0,
+        gen_efficiency: float = 0.9,
+        gen_efficiency_in: float = 1.0,
+        initial_soc: float = 0.0,
+        soc_min: float = None,
+        soc_max: float = None,
+        influx: float = 0.0,
+    ):
+        super().__init__(
+            name, network, bus,
+            e_nom=e_nom,
+            p_nom_in=p_nom_pump, p_nom_out=p_nom_turbine,
+            p_nom_electrical=p_nom_turbine,
+            eff_in=eff_store, eff_out=eff_dispatch,
+            gen_efficiency=gen_efficiency,
+            gen_efficiency_in=gen_efficiency_in,
+            initial_soc=initial_soc, soc_min=soc_min, soc_max=soc_max,
+            influx=influx,
+        )
 
     @property
-    def eff_store(self): return self._storage.eff_in
-    @eff_store.setter
-    def eff_store(self, v): self._storage.eff_in = v
+    def p_nom_pump(self): return self._storage.p_nom_in
+    @p_nom_pump.setter
+    def p_nom_pump(self, v): self._storage.p_nom_in = v
 
     @property
-    def eff_dispatch(self): return self._storage.eff_out
-    @eff_dispatch.setter
-    def eff_dispatch(self, v): self._storage.eff_out = v
-
-    @property
-    def initial_soc(self): return self._storage.initial_soc
-    @initial_soc.setter
-    def initial_soc(self, v): self._storage.initial_soc = v
-
-    @property
-    def soc_min(self): return self._storage.soc_min
-    @soc_min.setter
-    def soc_min(self, v): self._storage.soc_min = v
-
-    @property
-    def soc_max(self): return self._storage.soc_max
-    @soc_max.setter
-    def soc_max(self, v): self._storage.soc_max = v
-
-    def setup_constraints(self, model):
-        """Setup constraints for storage. Battery has no influx (set at __init__)."""
-        self._storage._setup_soc_constraints(model)
-
-    def setup_objective(self, network):
-        """Delegate objective to internal storage (battery has no direct objective contribution)."""
-        self._storage.setup_objective(network)
-
-    def get_p_net(self):
-        """
-        Return net power injection for KCL.
-
-        Net power = dispatch - store
-        Positive = power injected into bus (discharging)
-        Negative = power withdrawn from bus (charging)
-        """
-        return self._storage.var.p_out_t - self._storage.var.p_in_t
-
-    def __repr__(self) -> str:
-        return f"<Battery(name={self.name}, bus={self.bus.name}, e_nom={self.e_nom}, p_nom={self.p_nom})>"
+    def p_nom_turbine(self): return self._storage.p_nom_out
+    @p_nom_turbine.setter
+    def p_nom_turbine(self, v):
+        self._storage.p_nom_out = v
+        self._generator.p_nom = v
+        self._p_nom_electrical = v
