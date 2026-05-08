@@ -22,6 +22,22 @@ def _solution_as(variable, column_name):
     return df.rename({"solution": column_name})
 
 
+def _t_property_names(cls) -> list[str]:
+    """Return the ``_t``-suffixed property names declared anywhere on ``cls``'s MRO.
+
+    Used by both var/sol containers to discover view properties (concrete
+    ``_t`` views like ``_BatterySol.p_t`` *and* derived ``_pu_t`` views like
+    ``_GeneratorSol.p_pu_t``). Public properties only — leading underscore
+    skipped.
+    """
+    seen: set[str] = set()
+    for klass in cls.__mro__:
+        for name, attr in klass.__dict__.items():
+            if isinstance(attr, property) and name.endswith("_t") and not name.startswith("_"):
+                seen.add(name)
+    return sorted(seen)
+
+
 class _VarContainer:
     """Attribute bag for a component's pyoframe variables / expressions.
 
@@ -32,6 +48,11 @@ class _VarContainer:
     The bag stores its values in ``__dict__``; ``__repr__`` lists every
     plain (non-property) entry so a user typing ``gen.var`` at a REPL can
     see what's available.
+
+    Bracket access (``var["p_t"]``) and iteration (``list(var)``,
+    ``"p_t" in var``, ``var.keys()``) are supported alongside dot-access
+    so users can build keys programmatically and tab-discover what's
+    available.
     """
 
     __slots__ = ("__dict__", "_owner")
@@ -42,15 +63,52 @@ class _VarContainer:
         # (component parameters like p_nom) when computing _pu_t views.
         object.__setattr__(self, "_owner", owner)
 
+    def _names(self) -> list[str]:
+        """Sorted list of ``_t``-suffixed entries available on this container.
+
+        Combines concrete instance entries (pyoframe variables stored in
+        ``__dict__``) with view properties defined on the class (``p_pu_t``
+        on subclasses, plus property-backed ``_t`` entries for composites
+        like ``_BatteryVar.p_t``).
+        """
+        names: set[str] = {
+            k for k in self.__dict__
+            if k.endswith("_t") and not k.startswith("_")
+        }
+        names.update(_t_property_names(type(self)))
+        return sorted(names)
+
+    # --- Mapping-ish surface ---------------------------------------------
+    # We don't subclass collections.abc.Mapping because the values returned
+    # are not a uniform type (Variable / pyoframe expression / DataFrame on
+    # the sol side) and forcing __len__/items() to materialise everything
+    # would defeat lazy resolution. The four dunders below cover the actual
+    # use cases.
+
+    def __getitem__(self, key):
+        if not isinstance(key, str):
+            raise TypeError(
+                f"{type(self).__name__} keys are strings, got {type(key).__name__}"
+            )
+        try:
+            return getattr(self, key)
+        except AttributeError as e:
+            raise KeyError(str(e)) from None
+
+    def __iter__(self):
+        return iter(self._names())
+
+    def __contains__(self, key) -> bool:
+        return isinstance(key, str) and key in self._names()
+
+    def keys(self) -> list[str]:
+        return self._names()
+
     def __repr__(self) -> str:
-        items = sorted(k for k in self.__dict__ if not k.startswith("_"))
-        # Include any computed _pu_t view properties exposed by subclasses.
-        for cls in type(self).__mro__:
-            for name, attr in cls.__dict__.items():
-                if isinstance(attr, property) and name.endswith("_pu_t"):
-                    items.append(f"{name} (view)")
+        plain = sorted(k for k in self.__dict__ if not k.startswith("_"))
+        views = [f"{n} (view)" for n in _t_property_names(type(self))]
         owner_name = getattr(self._owner, "name", "?")
-        return f"<{type(self).__name__}({owner_name}): {', '.join(items)}>"
+        return f"<{type(self).__name__}({owner_name}): {', '.join(plain + views)}>"
 
 
 class _SolContainer:
@@ -64,6 +122,10 @@ class _SolContainer:
     Resolution is dynamic (computed on each access) so re-solving the model
     cannot leave a stale snapshot behind. Subclasses may override or extend
     with derived views (``_pu_t``).
+
+    Bracket access (``sol["p_t"]``) and iteration (``list(sol)``,
+    ``"p_t" in sol``, ``sol.keys()``) are supported alongside dot-access
+    so users can build keys programmatically.
     """
 
     __slots__ = ("_owner",)
@@ -76,23 +138,78 @@ class _SolContainer:
         # to AttributeError so typos still raise.
         if not name.endswith("_t"):
             raise AttributeError(name)
-        var = getattr(self._owner.var, name, None)
+        var = getattr(self._owner, "var", None)
         if var is None:
             raise AttributeError(
+                f"{type(self._owner).__name__} has no var container; "
+                f"cannot resolve sol.{name}."
+            )
+        target = getattr(var, name, None)
+        if target is None:
+            available = self._names()
+            raise AttributeError(
                 f"{type(self._owner).__name__} has no solution attribute {name!r}; "
-                f"available: {sorted(k for k in self._owner.var.__dict__ if k.endswith('_t'))}"
+                f"available: {available}"
             )
         # Friendly column name strips the trailing "_t" so consumers index by
         # the physical name (``df['p']``, ``df['soc']``).
         col = name[:-2] if name.endswith("_t") else name
-        return _solution_as(var, col)
+        return _solution_as(target, col)
+
+    def _names(self) -> list[str]:
+        """Sorted list of ``_t``-suffixed entries available on this container.
+
+        Two sources, unioned:
+        - Property-backed entries on this sol class (or its subclasses) —
+          covers ``_GeneratorSol.p_pu_t`` and the composite ``_BatterySol.p_t``
+          / ``_BatterySol.p_dispatch_t`` shape.
+        - Whatever resolves through the owner's ``var`` container (concrete
+          pyoframe variables in ``var.__dict__`` plus any of *its*
+          property-backed views). Skipped silently if the owner has no
+          ``var`` (e.g. ``Load`` deletes its ``var`` since loads have no
+          decision variables).
+        """
+        names: set[str] = set(_t_property_names(type(self)))
+        var = getattr(self._owner, "var", None)
+        if var is not None:
+            try:
+                names.update(var._names())
+            except AttributeError:
+                # Defensive: var doesn't follow the _names() protocol. Fall
+                # back to whatever's directly inspectable.
+                names.update(
+                    k for k in getattr(var, "__dict__", {})
+                    if k.endswith("_t") and not k.startswith("_")
+                )
+                names.update(_t_property_names(type(var)))
+        return sorted(names)
+
+    # --- Mapping-ish surface (mirrors _VarContainer; see comment there). --
+
+    def __getitem__(self, key):
+        if not isinstance(key, str):
+            raise TypeError(
+                f"{type(self).__name__} keys are strings, got {type(key).__name__}"
+            )
+        try:
+            return getattr(self, key)
+        except AttributeError as e:
+            raise KeyError(str(e)) from None
+
+    def __iter__(self):
+        return iter(self._names())
+
+    def __contains__(self, key) -> bool:
+        return isinstance(key, str) and key in self._names()
+
+    def keys(self) -> list[str]:
+        return self._names()
 
     def __repr__(self) -> str:
-        items = sorted(k for k in self._owner.var.__dict__ if k.endswith("_t"))
-        for cls in type(self).__mro__:
-            for name, attr in cls.__dict__.items():
-                if isinstance(attr, property) and name.endswith("_pu_t"):
-                    items.append(f"{name} (view)")
+        names = self._names()
+        # Tag the property-backed ones as views to match the existing repr style.
+        view_set = set(_t_property_names(type(self)))
+        items = [f"{n} (view)" if n in view_set else n for n in names]
         return f"<{type(self).__name__}({self._owner.name}): {', '.join(items)}>"
 
 

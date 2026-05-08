@@ -116,6 +116,19 @@ Use these instead of `gen.var.p_t.solution["solution"].to_list()` —
 same data, clearer intent. `Load` has no `var` (parameter, no decision
 variable); only `load.sol.p_t`.
 
+Both containers also support bracket access and iteration so tests that
+build keys programmatically don't have to reach for `getattr`:
+
+```python
+gen.sol["p_t"]              # same as gen.sol.p_t
+gen.var["p_pu_t"]           # same as gen.var.p_pu_t
+list(gen.sol)               # ["p_pu_t", "p_t"] — sorted
+"p_t" in gen.sol            # True
+gen.sol.keys()              # list of available _t entries
+```
+
+`gen.sol["bogus"]` raises `KeyError`; `gen.sol[42]` raises `TypeError`.
+
 ## Termination status
 
 ```python
