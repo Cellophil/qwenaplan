@@ -11,6 +11,22 @@ from .components import (
     PumpedHydroStorage,
     Battery,
 )
+from .views import View, _build_bus_view
+
+
+# Registry-attribute -> default view name. Keep aligned with
+# ``_COMPONENT_REGISTRY`` below; the auto-populator iterates this list
+# to mint a view per registry. Excludes ``buses`` (each bus gets its
+# own view, keyed by bus name) so we don't shadow user expectations.
+_DEFAULT_REGISTRY_VIEWS: list[tuple[str, str]] = [
+    ("generators", "generators"),
+    ("loads", "loads"),
+    ("storage_units", "storage_units"),
+    ("batteries", "batteries"),
+    ("pumped_hydro", "pumped_hydro"),
+    ("lines", "lines"),
+    ("links", "links"),
+]
 
 
 class Network:
@@ -23,6 +39,11 @@ class Network:
         self.storage_units: Dict[str, StorageUnit] = {}
         self.pumped_hydro: Dict[str, PumpedHydroStorage] = {}
         self.batteries: Dict[str, Battery] = {}
+
+        # Named subsets of components with aggregated var/sol surfaces.
+        # Auto-populated at ``create_model()`` (one entry per registry +
+        # one per bus); users may also assign their own.
+        self.views: Dict[str, View] = {}
 
         self.snapshots = None
         # Per-snapshot timing (filled by set_snapshots/set_snapshot_durations):
@@ -239,7 +260,44 @@ class Network:
         # treats that as a feasibility problem.
 
         self._is_locked = True
+        # Populate default views now that the registries are stable. We
+        # do this after locking so a view's component list is guaranteed
+        # not to grow under it; users adding custom views afterwards is
+        # fine (they overwrite or add new keys on the plain dict).
+        self._populate_default_views()
         print("Model created and network locked.")
+
+    def _populate_default_views(self):
+        """Build the auto-populated ``self.views`` entries.
+
+        One view per non-empty registry (``"generators"``, ``"loads"``,
+        ``"lines"``, etc.) plus one per bus (keyed by bus name, with the
+        bus-injection sign convention). Empty registries get an empty
+        view so ``n.views["loads"]`` is always present — the sol layer
+        returns a snapshot-indexed zero column for empty cases.
+
+        Bus / registry-name collisions raise loudly. None of the
+        registry names (``"generators"`` etc.) are valid bus names in
+        practice, but the explicit check is cheap and the alternative
+        is silent shadowing of the KCL identity.
+        """
+        # 1. Registry views. Pass ``network=self`` so empty registries
+        # (e.g. a network with no batteries) still have a network handle
+        # for the sol layer to read the snapshot dim from.
+        for registry_attr, view_name in _DEFAULT_REGISTRY_VIEWS:
+            members = list(getattr(self, registry_attr).values())
+            self.views[view_name] = View(view_name, members, network=self)
+
+        # 2. Bus views.
+        registry_names = {name for _, name in _DEFAULT_REGISTRY_VIEWS}
+        for bus_name, bus in self.buses.items():
+            if bus_name in registry_names:
+                raise ValueError(
+                    f"Bus name {bus_name!r} collides with a default registry "
+                    f"view of the same name. Rename the bus to avoid shadowing "
+                    f"the n.views[{bus_name!r}] aggregation."
+                )
+            self.views[bus_name] = _build_bus_view(self, bus)
 
     def _add_to_objective(self, expr: Any):
         """Components call this from their ``setup_objective`` to contribute.

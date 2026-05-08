@@ -129,6 +129,26 @@ gen.sol.keys()              # list of available _t entries
 
 `gen.sol["bogus"]` raises `KeyError`; `gen.sol[42]` raises `TypeError`.
 
+## Views: cross-component aggregation
+
+Use `n.views[<name>]` when a test cares about an *identity that spans
+several components* — total generation, KCL at a bus, regional caps.
+Use the per-component `obj.sol` / `obj.var` when the test is about one
+component's behaviour.
+
+```python
+n.views["generators"].sol.p_t            # wide: time, Coal, Solar, ...
+n.views["generators"].sol.p_t_sum        # collapsed: time, p (same shape as gen.sol.p_t)
+n.views["Bus2"].sol.p_t_sum              # ≈ 0 per snapshot (KCL identity)
+n.model.cap = n.views["generators"].var.p_t_sum <= 60.0   # symbolic constraint
+```
+
+Tests for the views layer itself live in `test_views.py` —
+`injection_at` / `injection_sign_at` (the underlying abstraction that
+lets KCL and the views layer share one source of truth for branch
+sign) live in `test_injection_at.py`. Per-component tests should
+stick to per-component containers.
+
 ## Termination status
 
 ```python

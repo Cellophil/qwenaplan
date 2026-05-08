@@ -83,6 +83,41 @@ phs.sol.p_pu_t                             # turbine output as fraction of p_nom
 parameter data), so there is no `load.var`. `load.sol.p_t` returns the
 parameter and is available **before** solving too.
 
+### Views: aggregating across components
+
+`n.views` is a dict of named subsets that share the per-component `var`
+/ `sol` shape but aggregate across their members. After `create_model()`
+the dict is auto-populated with one view per registry (`"generators"`,
+`"loads"`, `"lines"`, `"links"`, `"storage_units"`, `"batteries"`,
+`"pumped_hydro"`) and one view per bus (keyed by bus name).
+
+```python
+# Wide DataFrame: one column per generator, in registry-insertion order.
+n.views["generators"].sol.p_t            # cols: time, Coal, Solar, Peaker
+
+# Per-snapshot total — same shape as a single component's sol.p_t, so
+# downstream code is interchangeable.
+n.views["generators"].sol.p_t_sum        # cols: time, p
+
+# Symbolic side: a single pyoframe expression usable as a constraint.
+n.model.regional_cap = n.views["generators"].var.p_t_sum <= 100.0
+
+# Bus views apply the bus-injection sign convention; rows of the wide
+# DataFrame sum to zero per snapshot — KCL read off the data.
+n.views["Bus2"].sol.p_t                   # signed contributions per member
+n.views["Bus2"].sol.p_t_sum               # ≈ 0 within solver tolerance
+
+# User-defined views work the same way.
+n.views["thermal"] = qp.View("thermal", [n.generators["Coal"], n.generators["Peaker"]])
+```
+
+`view.var` exposes only the `_sum` form (a list of pyoframe expressions
+doesn't compose into a constraint); `view.sol` exposes both wide
+(per-member columns) and `_sum` (collapsed). Loads enter the var-side
+sum as a `pf.Param` of `−p_set`, so a custom view mixing generators
+and loads resolves to a usable expression with the load as the
+constant. Buses cannot be view members.
+
 ### Components
 
 - **`Bus`** — node; carries a phase-angle variable for KVL.
@@ -123,6 +158,7 @@ qwenaplan/
 │       ├── components.py      # Bus / Generator / Load / ACLine / Link / Storage*
 │       ├── network.py         # Network: registries, set_snapshots, create_model, optimize
 │       ├── physics.py         # DC KCL / KVL builders
+│       ├── views.py           # qp.View — aggregated var/sol over component subsets
 │       └── importers.py       # PyPSA → qwenaplan
 └── tests/
     ├── conftest.py

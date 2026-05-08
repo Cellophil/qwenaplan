@@ -101,22 +101,26 @@ print(f"objective = {n.objective_value:,.0f} €  ({status})")
 #%% Pull results into one tidy frame
 #
 # Every component exposes `.sol.<name>_t` as a polars DataFrame keyed by
-# the snapshot dim. Joining on "hour" gives one long-form frame ready
-# for plotly.
+# the snapshot dim. The `views` layer pre-builds aggregated frames for
+# every registry (`"generators"`, `"loads"`, ...) and every bus, so we
+# can grab the wide dispatch table without joining by hand.
 
 H = snapshots.name  # "hour"
 
-dispatch = (
-    n.generators["Coal"].sol.p_t.rename({"p": "Coal"})
-    .join(n.generators["Solar"].sol.p_t.rename({"p": "Solar"}), on=H)
-    .join(n.generators["Peaker"].sol.p_t.rename({"p": "Peaker"}), on=H)
-    .join(battery.sol.p_t.rename({"p": "Battery_net"}), on=H)
+# Wide dispatch frame: one column per generator, in registry-insertion
+# order (Coal, Solar, Peaker). The battery is a separate registry
+# (`"batteries"`) so we still join its column on by hand — until the
+# planned Battery → hybrid storage+generator refactor lands and it
+# joins the generators view naturally.
+dispatch = n.views["generators"].sol.p_t.join(
+    battery.sol.p_t.rename({"p": "Battery_net"}), on=H,
 )
 
+# Total load: `n.views["loads"].sol.p_t_sum` is the per-snapshot total
+# already (positive demand), so no with_columns / addition needed.
 total_load = (
-    n.loads["Load_urban"].sol.p_t.rename({"p": "urban"})
-    .join(n.loads["Load_rural"].sol.p_t.rename({"p": "rural"}), on=H)
-    .with_columns((pl.col("urban") + pl.col("rural")).alias("total"))
+    n.views["loads"].sol.p_t.rename({"Load_urban": "urban", "Load_rural": "rural"})
+    .join(n.views["loads"].sol.p_t_sum.rename({"p": "total"}), on=H)
 )
 
 print(dispatch.head())
@@ -246,12 +250,12 @@ fig4.show()
 
 
 #%% Plot 5 — capacity factors via the `_pu_t` views
+#
+# Generators expose `sol.p_pu_t` (= p / p_nom). The view aggregates the
+# wide form for free — same columns as `n.views["generators"].sol.p_t`,
+# but with capacity-factor units.
 
-cf = (
-    n.generators["Coal"].sol.p_pu_t.rename({"p_pu": "Coal"})
-    .join(n.generators["Solar"].sol.p_pu_t.rename({"p_pu": "Solar"}), on=H)
-    .join(n.generators["Peaker"].sol.p_pu_t.rename({"p_pu": "Peaker"}), on=H)
-)
+cf = n.views["generators"].sol.p_pu_t
 
 fig5 = go.Figure()
 for col, color in [("Coal", "#5a5a5a"), ("Solar", "#f4c430"),
@@ -264,6 +268,24 @@ fig5.update_layout(
     yaxis_range=[0, 1.05], template="plotly_white",
 )
 fig5.show()
+
+
+#%% KCL identity at Bus2 — read off the data
+#
+# The auto-populated bus view applies the bus-injection sign convention:
+# generators positive, loads negative, storage net (p_out − p_in),
+# branches `+` at the to_bus and `−` at the from_bus. So the rows of
+# `n.views["Bus2"].sol.p_t` must sum to zero per snapshot — that's KCL,
+# but read off the solved data instead of off the LP. The
+# `sol.p_t_sum` column is the same identity, collapsed per row.
+
+bus2_wide = n.views["Bus2"].sol.p_t
+bus2_kcl = n.views["Bus2"].sol.p_t_sum
+
+print("Bus2 wide injection (cols sum to zero per row, within solver tol):")
+print(bus2_wide.head())
+print(f"max |Bus2 KCL residual|: "
+      f"{bus2_kcl['p'].abs().max():.2e} MW")
 
 
 #%% Headline numbers

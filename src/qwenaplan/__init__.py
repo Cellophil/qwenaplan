@@ -11,6 +11,7 @@ from .components import (
     PumpedHydroStorage,
     Battery,
 )
+from .views import View
 from .importers import PyPSAImporter
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "StorageUnit",
     "PumpedHydroStorage",
     "Battery",
+    "View",
     "PyPSAImporter",
 ]

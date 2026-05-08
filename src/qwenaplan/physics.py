@@ -13,16 +13,16 @@ class DCPhysics:
         """
         KCL: at every bus, injected power equals withdrawn + net outflow.
 
-        Sign convention (collected on the LHS, balance == 0):
-          + Generator output       (var.p_t)
-          - Load demand            (Load.get_p_net() returns -p_set)
-          + Storage net injection  (p_out - p_in via get_p_net())
-          - Outgoing line/link flow (sign depends on from_bus / to_bus)
-          + Incoming line/link flow
+        Each connected component answers ``injection_at(bus)`` with its
+        signed contribution (Generator: ``+var.p_t``; Load:
+        ``-p_set`` as ``pf.Param``; storage: ``+(p_out - p_in)``;
+        branches: ``+var.p_t`` at ``to_bus``, ``-var.p_t`` at
+        ``from_bus``). KCL just sums them and constrains the sum to
+        zero — the sign convention lives on the components, not here.
 
-        There is no nodal slack variable: if generation cannot meet load with
-        the available transmission, the LP is infeasible. To absorb shortfall,
-        add an explicit high-marginal-cost generator at the bus.
+        There is no nodal slack variable: if generation cannot meet load
+        with the available transmission, the LP is infeasible. To absorb
+        shortfall, add an explicit high-marginal-cost generator at the bus.
         """
         balance_expr = None
 
@@ -30,21 +30,10 @@ class DCPhysics:
             nonlocal balance_expr
             balance_expr = expr if balance_expr is None else balance_expr + expr
 
-        # 1. Power elements at this bus (generators, loads, storage units, ...)
-        for element in bus.network.get_connected_power_elements(bus):
-            # Storage / Load (and composites) implement get_p_net(); plain
-            # Generator falls back to its primary variable on var.p_t.
-            if hasattr(element, "get_p_net"):
-                _accum(element.get_p_net())
-            else:
-                _accum(element.var.p_t)
-
-        # 2. Line / link flows. from_bus = outflow (subtract), to_bus = inflow (add).
-        for line in bus.network.get_connected_lines(bus):
-            if line.from_bus == bus:
-                _accum(-line.var.p_t)
-            else:
-                _accum(line.var.p_t)
+        for c in bus.network.get_connected_power_elements(bus):
+            _accum(c.injection_at(bus))
+        for branch in bus.network.get_connected_lines(bus):
+            _accum(branch.injection_at(bus))
 
         # If a bus has nothing attached, KCL is trivially 0 == 0; skip the
         # constraint entirely so we don't dump a degenerate row on the solver.

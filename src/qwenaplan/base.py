@@ -258,6 +258,72 @@ class Component(ABC):
         """
         pass
 
+    # ---- Bus-injection abstraction ---------------------------------------
+    # Every component answers "what do I contribute at this bus?" via the
+    # same call. Power elements ignore the argument (they only touch one
+    # bus); branches override below to sign their flow by which end ``bus``
+    # is. KCL ([physics.py]) calls into this so the from_bus / to_bus
+    # if-statement lives exactly once, and the views layer
+    # ([views.py]) reuses the same call so the sol-side bus view shares
+    # the sign convention with the symbolic side. No magic — just an
+    # interface that lets the two sides of the codebase stay consistent.
+
+    def injection_sign_at(self, bus) -> int:
+        """Numeric sign of this component's net injection at ``bus``.
+
+        Default: ``+1``. Branches override to return ``+1`` at ``to_bus``
+        and ``-1`` at ``from_bus``. Used by the views layer to sign the
+        symbolic contribution to ``view.var.p_t_sum`` (where pyoframe
+        composes the signed expression cleanly).
+
+        Raises ``ValueError`` if the component does not touch ``bus`` —
+        only meaningful on the branch override.
+        """
+        return +1
+
+    def sol_sign_at(self, bus) -> int:
+        """Numeric sign to apply on ``sol.p_t`` for a *bus view* DataFrame.
+
+        Mirrors :meth:`injection_sign_at`, but corrects for components
+        whose ``sol.p_t`` is in a different convention than their bus
+        injection. The default is ``+1`` because most ``sol.p_t`` frames
+        are already in injection convention (Generator output is
+        positive injection; storage's ``sol.p_t`` is already
+        ``p_out − p_in``, the signed net). Two overrides:
+
+        - :class:`Load` — ``sol.p_t`` is the *demand* (positive value);
+          the bus injection is the negation, so this returns ``-1``.
+        - :class:`BranchElement` — same orientation rule as
+          ``injection_sign_at`` (``+1`` at ``to_bus``, ``-1`` at ``from_bus``).
+
+        Used by :class:`_ViewSol` to ensure rows of
+        ``n.views[bus].sol.p_t`` sum to zero per snapshot. Without this
+        the var-side and sol-side bus views would disagree on Load's
+        sign, breaking the KCL-read-off-the-data contract.
+        """
+        return +1
+
+    def injection_at(self, bus):
+        """Pyoframe expression for this component's net injection at ``bus``.
+
+        Power-element default: returns ``get_p_net()`` if defined (Load,
+        storage, composites — already used by KCL), else falls back to
+        ``var.p_t`` (plain Generator). The ``bus`` argument is ignored —
+        power elements only touch one bus, and ``injection_sign_at`` is
+        a no-op for them.
+
+        Branch elements override (see :class:`BranchElement`) to apply
+        the sign returned by ``injection_sign_at(bus)`` so a positive
+        ``var.p_t`` (flow from→to) becomes a positive contribution at
+        the ``to_bus`` and a negative one at the ``from_bus``.
+        """
+        sign = self.injection_sign_at(bus)
+        if hasattr(self, "get_p_net"):
+            base = self.get_p_net()
+        else:
+            base = self.var.p_t
+        return base if sign == 1 else sign * base
+
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}(name={self.name})>"
 
@@ -287,3 +353,28 @@ class BranchElement(Component):
             raise TypeError("Both from_bus and to_bus must be Bus objects")
         self.from_bus = from_bus
         self.to_bus = to_bus
+
+    # The from_bus / to_bus distinction is arbitrary at modelling time
+    # (PyPSA's bus0 / bus1 inheritance). Consumers asking "what does this
+    # branch do at *my* bus?" go through ``injection_at(bus)`` and never
+    # have to know the orientation themselves. ``var.p_t`` is signed
+    # ``from_bus → to_bus``, so the to_bus sees ``+p_t`` and the from_bus
+    # sees ``-p_t``.
+
+    def injection_sign_at(self, bus) -> int:
+        if bus is self.to_bus:
+            return +1
+        if bus is self.from_bus:
+            return -1
+        raise ValueError(
+            f"{type(self).__name__} {self.name!r} does not touch bus "
+            f"{bus.name!r}; touches {self.from_bus.name!r} and {self.to_bus.name!r}."
+        )
+
+    # Branches use the same sign rule on the sol side as on the var
+    # side: ``sol.p_t`` is already signed ``from_bus → to_bus``, so
+    # negating at the from_bus is the right correction. (Power
+    # elements and storage default to ``+1`` because their ``sol.p_t``
+    # is already in injection convention; Load overrides to ``-1``.)
+    def sol_sign_at(self, bus) -> int:
+        return self.injection_sign_at(bus)

@@ -420,6 +420,16 @@ class Load(PowerElement):
         )
         return pf.Param(df)
 
+    # ``sol.p_t`` returns the demand magnitude (positive ``p_set``); the
+    # *bus injection* is the negation. Bus views use this so a row of
+    # n.views[bus].sol.p_t sums to zero — the load contributes its
+    # withdrawal as a negative value, matching the var-side ``-Param``.
+    # On the var side ``injection_at`` already pulls ``get_p_net()`` and
+    # gets the correct sign for free; the sol side cannot share that
+    # path because ``sol.p_t`` is shaped as a polars frame.
+    def sol_sign_at(self, bus) -> int:
+        return -1
+
     def __repr__(self) -> str:
         p = self._p_set if self._p_set is not None else "<profile>"
         return f"<Load(name={self.name}, bus={self.bus.name}, p_set={p})>"
@@ -1053,6 +1063,29 @@ class StorageComposite(ABC):
         self._storage.setup_objective(network)
         if self._generator:
             self._generator.setup_objective(network)
+
+    # Mirror :meth:`Component.injection_at` / :meth:`Component.injection_sign_at`
+    # so KCL and the views layer can call them uniformly across power
+    # elements, branches, and composites. ``StorageComposite`` doesn't
+    # inherit from :class:`Component` (yet — see the deferred Battery /
+    # PHS unification plan), so we duplicate the small default here. The
+    # two methods together are the single contract the rest of the code
+    # talks to: ``injection_at(bus)`` for the symbolic side,
+    # ``injection_sign_at(bus)`` for the numeric side.
+    def injection_sign_at(self, bus) -> int:
+        return +1
+
+    def sol_sign_at(self, bus) -> int:
+        # ``sol.p_t`` on Battery / PHS is already the signed net (Battery:
+        # ``p_dispatch − p_store``; PHS: the generator's electrical
+        # output, positive = injection). Same sign as a generator at
+        # this bus.
+        return +1
+
+    def injection_at(self, bus):
+        sign = self.injection_sign_at(bus)
+        base = self.get_p_net()
+        return base if sign == 1 else sign * base
 
 
 class PumpedHydroStorage(StorageComposite):
